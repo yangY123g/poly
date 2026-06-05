@@ -31,8 +31,8 @@ const DEFAULT_WALLET = "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30";
 const CRYPTO_ASSETS = ["BTC", "ETH"];
 const CRYPTO_HORIZONS = ["5m", "15m"];
 const CRYPTO_LEGS = [
-  { key: "BTC5m", asset: "BTC", horizon: "5m", durationSec: 300, budgetWeight: 0.1, parentKey: "BTC15m" },
-  { key: "BTC15m", asset: "BTC", horizon: "15m", durationSec: 900, budgetWeight: 1.55, parentKey: "" },
+  { key: "BTC5m", asset: "BTC", horizon: "5m", durationSec: 300, budgetWeight: 0.06, parentKey: "BTC15m" },
+  { key: "BTC15m", asset: "BTC", horizon: "15m", durationSec: 900, budgetWeight: 0.72, parentKey: "" },
   { key: "ETH5m", asset: "ETH", horizon: "5m", durationSec: 300, budgetWeight: 0.05, parentKey: "ETH15m" },
   { key: "ETH15m", asset: "ETH", horizon: "15m", durationSec: 900, budgetWeight: 0.46, parentKey: "" },
 ];
@@ -40,13 +40,58 @@ const CRYPTO_UPDOWN_RE = /^(btc|eth)-updown-(5m|15m)-(\d+)$/i;
 const BTC_5M_RE = /^btc-updown-5m-(\d+)$/;
 const ACTIVITY_TYPES = ["TRADE", "REDEEM"];
 const OUTCOMES = ["Up", "Down"];
-const POLYMARKET_MIN_ORDER_USDC = 1;
+const POLYMARKET_MIN_ORDER_USDC = 5;
 const POLYMARKET_MIN_ORDER_SHARES = 5;
-const STRATEGY_VERSION_ID = "portfolio-v16-strict-fill-latency";
-const STRATEGY_VERSION_NAME = "新规则版本：严格盘口成交/手续费 + 600ms 响应延迟";
+const STRATEGY_VERSION_ID = "portfolio-v27-min5u-defensive-budget-floor";
+const STRATEGY_VERSION_NAME = "v27 min-5U floor: defensive budgets and order caps cannot fall below exchange minimum";
+const SMALL_BANKROLL_STRATEGY_VERSION_ID = "portfolio-v22-50u-min5u-realistic";
+const SMALL_BANKROLL_STRATEGY_VERSION_NAME = "50U v22 min-5U realistic orders: fewer entries, real-size risk checks";
 const LEDGER_RESET_ID = "full-ledger-reset-v1-hourly";
 const LEDGER_RESET_NAME = "总账重置：从新规则小时收益率版本重新计数";
 const feeRateCache = new Map();
+
+function strategyVersionForOpts(opts = {}) {
+  const bankroll = num(opts.cloneBankrollUsdc, 0);
+  if (bankroll > 0 && bankroll <= 100) {
+    return {
+      id: SMALL_BANKROLL_STRATEGY_VERSION_ID,
+      name: SMALL_BANKROLL_STRATEGY_VERSION_NAME,
+    };
+  }
+  return {
+    id: STRATEGY_VERSION_ID,
+    name: STRATEGY_VERSION_NAME,
+  };
+}
+
+function normalizeCloneLegKey(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(BTC|ETH)(5m|15m)$/i);
+  return match ? `${match[1].toUpperCase()}${match[2].toLowerCase()}` : "";
+}
+
+function parseCloneLegCaps(value) {
+  const caps = {};
+  for (const part of String(value || "").split(/[;,]/)) {
+    const [rawKey, rawValue] = part.split("=");
+    const key = normalizeCloneLegKey(rawKey);
+    const cap = Number(rawValue);
+    if (!key || !Number.isFinite(cap)) continue;
+    caps[key] = Math.max(0, cap);
+  }
+  return caps;
+}
+
+function normalizeCloneLegCaps(caps) {
+  const normalized = {};
+  for (const [rawKey, rawValue] of Object.entries(caps || {})) {
+    const key = normalizeCloneLegKey(rawKey);
+    const cap = Number(rawValue);
+    if (!key || !Number.isFinite(cap)) continue;
+    normalized[key] = round(Math.max(0, cap), 2);
+  }
+  return normalized;
+}
 
 function parseArgs(argv) {
   const opts = {
@@ -114,6 +159,8 @@ function parseArgs(argv) {
     cloneExecutionLatencyMs: 600,
     cloneQueueDelaySec: 1,
     cloneMinFillUsdc: POLYMARKET_MIN_ORDER_USDC,
+    cloneMinFillPrice: 0.01,
+    cloneLateEntryBufferSec: 4,
     cloneMinVisibleDepthUsdc: 2,
     cloneMakerPenetrationTicks: 1,
     cloneTakerFeeRate: 0.07,
@@ -122,6 +169,8 @@ function parseArgs(argv) {
     cloneMaxDirectionExposureUsdc: 220,
     cloneMaxConsecutiveLosses: 3,
     cloneAdaptive: true,
+    cloneBankrollUsdc: 0,
+    cloneLegCaps: {},
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -199,6 +248,8 @@ function parseArgs(argv) {
     else if (arg.startsWith("--clone-execution-latency-ms")) opts.cloneExecutionLatencyMs = Number(readValue());
     else if (arg.startsWith("--clone-queue-delay-sec")) opts.cloneQueueDelaySec = Number(readValue());
     else if (arg.startsWith("--clone-min-fill-usdc")) opts.cloneMinFillUsdc = Number(readValue());
+    else if (arg.startsWith("--clone-min-fill-price")) opts.cloneMinFillPrice = Number(readValue());
+    else if (arg.startsWith("--clone-late-entry-buffer-sec")) opts.cloneLateEntryBufferSec = Number(readValue());
     else if (arg.startsWith("--clone-min-visible-depth-usdc")) opts.cloneMinVisibleDepthUsdc = Number(readValue());
     else if (arg.startsWith("--clone-maker-penetration-ticks")) opts.cloneMakerPenetrationTicks = Number(readValue());
     else if (arg.startsWith("--clone-taker-fee-rate")) opts.cloneTakerFeeRate = Number(readValue());
@@ -208,6 +259,8 @@ function parseArgs(argv) {
     else if (arg.startsWith("--clone-max-consecutive-losses")) opts.cloneMaxConsecutiveLosses = Number(readValue());
     else if (arg === "--clone-adaptive") opts.cloneAdaptive = true;
     else if (arg === "--no-clone-adaptive") opts.cloneAdaptive = false;
+    else if (arg.startsWith("--clone-bankroll-usdc")) opts.cloneBankrollUsdc = Number(readValue());
+    else if (arg.startsWith("--clone-leg-caps")) opts.cloneLegCaps = parseCloneLegCaps(readValue());
     else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -273,6 +326,8 @@ function parseArgs(argv) {
   opts.cloneExecutionLatencyMs = clampInt(opts.cloneExecutionLatencyMs, 0, 10_000, 600);
   opts.cloneQueueDelaySec = clampInt(opts.cloneQueueDelaySec, 0, 60, 1);
   opts.cloneMinFillUsdc = clampNum(opts.cloneMinFillUsdc, POLYMARKET_MIN_ORDER_USDC, 50, POLYMARKET_MIN_ORDER_USDC);
+  opts.cloneMinFillPrice = clampNum(opts.cloneMinFillPrice, 0.01, 0.99, 0.01);
+  opts.cloneLateEntryBufferSec = clampInt(opts.cloneLateEntryBufferSec, 0, 600, 4);
   opts.cloneMinVisibleDepthUsdc = clampNum(opts.cloneMinVisibleDepthUsdc, 0, 500, 2);
   opts.cloneMakerPenetrationTicks = clampInt(opts.cloneMakerPenetrationTicks, 0, 10, 1);
   opts.cloneTakerFeeRate = clampNum(opts.cloneTakerFeeRate, 0, 0.5, 0.07);
@@ -280,6 +335,8 @@ function parseArgs(argv) {
   opts.cloneDailyLossLimitUsdc = clampNum(opts.cloneDailyLossLimitUsdc, 0, 100000, 5000);
   opts.cloneMaxDirectionExposureUsdc = clampNum(opts.cloneMaxDirectionExposureUsdc, 1, 250000, 35);
   opts.cloneMaxConsecutiveLosses = clampInt(opts.cloneMaxConsecutiveLosses, 0, 100, 3);
+  opts.cloneBankrollUsdc = clampNum(opts.cloneBankrollUsdc, 0, 250000, 0);
+  opts.cloneLegCaps = normalizeCloneLegCaps(opts.cloneLegCaps);
   if (!/^0x[a-fA-F0-9]{40}$/.test(opts.wallet)) throw new Error(`Invalid wallet: ${opts.wallet}`);
   return opts;
 }
@@ -298,12 +355,16 @@ Options:
   --clone / --no-clone        Enable behavior clone engine. Default: enabled
   --clone-budget-usdc <n>     Paper budget per window. Default: 10000
   --clone-order-usdc <n>      Base paper clip size. Default: 8.5
+  --clone-bankroll-usdc <n>   Starting paper bankroll for the equity curve
+  --clone-leg-caps <csv>      Hard per-leg caps, e.g. BTC5m=0,BTC15m=16,ETH5m=0,ETH15m=18
   --clone-min-signal-bps <n>  Min BTC move vs Polymarket open before entry. Default: 1.2
   --clone-high-confidence-bps <n>  Scale up after this BTC signal. Default: 8
   --clone-max-clip-usdc <n>   Max dynamic paper clip. Default: 500
   --clone-max-orders-per-window <n>  Max paper entry orders per 5m window. 0 means unlimited. Default: 0
   --clone-exit                Enable intrawindow paper sells. Default: disabled
   --clone-slippage-bps <n>    Paper taker slippage cushion. Default: 30
+  --clone-min-fill-price <n>  Ignore extreme low-price fills below this price. Default: 0.01
+  --clone-late-entry-buffer-sec <n>  Stop entries this many seconds before window close. Default: 4
   --clone-daily-loss-limit-usdc <n>  Pause after daily paper loss. Default: 5000
   --no-clone-adaptive         Disable small adaptive parameter tuning
   --reset                     Ignore an existing state.json and start fresh
@@ -733,6 +794,7 @@ function createInitialCloneState(opts, slugOverride = null) {
   const asset = slugAsset(slug) || "BTC";
   const horizon = slugHorizon(slug) || "5m";
   const legKey = slugLegKey(slug) || `${asset}${horizon}`;
+  const strategyVersion = strategyVersionForOpts(opts);
   return {
     enabled: Boolean(opts.clone && slug),
     status: opts.clone && slug ? "starting" : "disabled",
@@ -740,8 +802,8 @@ function createInitialCloneState(opts, slugOverride = null) {
     asset,
     horizon,
     legKey,
-    strategyVersionId: STRATEGY_VERSION_ID,
-    strategyVersionName: STRATEGY_VERSION_NAME,
+    strategyVersionId: strategyVersion.id,
+    strategyVersionName: strategyVersion.name,
     versionStartedAt: null,
     ledgerResetId: "",
     ledgerResetName: "",
@@ -834,6 +896,8 @@ function emptyDirectionExposure() {
 
 function cloneConfig(opts) {
   return {
+    bankrollUsdc: opts.cloneBankrollUsdc,
+    legCapUsdc: finiteNum(opts.cloneLegCapUsdc, null),
     budgetUsdc: opts.cloneBudgetUsdc,
     orderUsdc: opts.cloneOrderUsdc,
     entryStartSec: opts.cloneEntryStartSec,
@@ -884,6 +948,8 @@ function cloneConfig(opts) {
     executionLatencyMs: opts.cloneExecutionLatencyMs,
     queueDelaySec: opts.cloneQueueDelaySec,
     minFillUsdc: opts.cloneMinFillUsdc,
+    minFillPrice: opts.cloneMinFillPrice,
+    lateEntryBufferSec: opts.cloneLateEntryBufferSec,
     minVisibleDepthUsdc: opts.cloneMinVisibleDepthUsdc,
     makerPenetrationTicks: opts.cloneMakerPenetrationTicks,
     takerFeeRate: opts.cloneTakerFeeRate,
@@ -949,6 +1015,20 @@ function attachCloneVersion(clone, version) {
   clone.versionStartedAt = version.startedAt;
 }
 
+function normalizeStrategyVersionNames(state, strategyVersion) {
+  if (!state || !strategyVersion?.id) return;
+  const rewrite = (row) => {
+    if (row && row.strategyVersionId === strategyVersion.id) row.strategyVersionName = strategyVersion.name;
+  };
+  rewrite(state.clone);
+  for (const row of state.cloneHistory || []) rewrite(row);
+  for (const row of Object.values(state.clonePortfolio?.assets || {})) rewrite(row);
+  if (state.cloneVersion?.id === strategyVersion.id) state.cloneVersion.name = strategyVersion.name;
+  if (state.cloneVersionCumulative?.versionId === strategyVersion.id) {
+    state.cloneVersionCumulative.versionName = strategyVersion.name;
+  }
+}
+
 function ensureClonePortfolioState(state, opts) {
   state.clonePortfolio ||= {
     enabled: Boolean(opts.clone && opts.autoBtc5m),
@@ -979,6 +1059,12 @@ function ensureClonePortfolioState(state, opts) {
   }
 }
 
+function cloneLegCapForSlug(opts, slug) {
+  const key = slugLegKey(slug);
+  const cap = opts.cloneLegCaps?.[key];
+  return Number.isFinite(num(cap, NaN)) ? Math.max(0, num(cap)) : null;
+}
+
 function cloneOptsForSlug(opts, slug) {
   const leg = cryptoLegForSlug(slug);
   const weight = Number.isFinite(num(leg?.budgetWeight, NaN)) ? num(leg.budgetWeight) : 1;
@@ -986,22 +1072,39 @@ function cloneOptsForSlug(opts, slug) {
   const isFiveMinute = durationSec <= 300;
   const asset = slugAsset(slug);
   const isEth = asset === "ETH";
+  const isSmallBankroll = num(opts.cloneBankrollUsdc, 0) > 0 && num(opts.cloneBankrollUsdc, 0) <= 100;
   const durationFactor = durationSec > 300 ? 1.25 : 1;
+  const legCapUsdc = cloneLegCapForSlug(opts, slug);
+  const computedBudgetUsdc = num(opts.cloneBudgetUsdc) * weight * durationFactor;
+  const computedMaxClipUsdc = Math.max(POLYMARKET_MIN_ORDER_USDC, num(opts.cloneMaxClipUsdc) * Math.sqrt(weight) * durationFactor);
+  const computedDirectionExposureUsdc = num(opts.cloneMaxDirectionExposureUsdc) * weight * durationFactor;
+  const cappedBudgetUsdc = legCapUsdc === null ? computedBudgetUsdc : Math.min(computedBudgetUsdc, legCapUsdc);
+  const cappedMaxClipUsdc = legCapUsdc === null ? computedMaxClipUsdc : Math.min(computedMaxClipUsdc, Math.max(POLYMARKET_MIN_ORDER_USDC, legCapUsdc));
+  const cappedDirectionExposureUsdc = legCapUsdc === null ? computedDirectionExposureUsdc : Math.min(computedDirectionExposureUsdc, legCapUsdc);
+  const cloneEnabled = Boolean(opts.clone && slug && (legCapUsdc === null || legCapUsdc >= POLYMARKET_MIN_ORDER_USDC));
+  const requestedLateEntryBufferSec = clampInt(opts.cloneLateEntryBufferSec, 0, Math.max(0, durationSec - 1), 4);
+  const lateEntryBufferSec = isSmallBankroll
+    ? Math.min(requestedLateEntryBufferSec, isFiveMinute ? 55 : 90)
+    : requestedLateEntryBufferSec;
   const entryStartSec = Math.min(num(opts.cloneEntryStartSec), Math.max(0, durationSec - 10));
   const entryEndSec = durationSec > 300
-    ? Math.max(entryStartSec, durationSec - 4)
+    ? Math.max(entryStartSec, durationSec - lateEntryBufferSec)
     : Math.min(num(opts.cloneEntryEndSec), durationSec);
   return {
     ...opts,
+    clone: cloneEnabled,
     slug,
     eventUrl: eventUrlForSlug(slug),
-    cloneBudgetUsdc: round(num(opts.cloneBudgetUsdc) * weight * durationFactor, 2),
+    cloneBankrollUsdc: opts.cloneBankrollUsdc,
+    cloneLegCapUsdc: legCapUsdc,
+    cloneBudgetUsdc: round(cappedBudgetUsdc, 2),
     cloneOrderUsdc: round(Math.max(POLYMARKET_MIN_ORDER_USDC, num(opts.cloneOrderUsdc) * Math.sqrt(weight)), 2),
     cloneProbeOrderUsdc: round(Math.max(POLYMARKET_MIN_ORDER_USDC, num(opts.cloneProbeOrderUsdc) * Math.sqrt(Math.max(0.35, weight))), 2),
-    cloneMaxClipUsdc: round(Math.max(POLYMARKET_MIN_ORDER_USDC, num(opts.cloneMaxClipUsdc) * Math.sqrt(weight) * durationFactor), 2),
-    cloneMaxDirectionExposureUsdc: round(num(opts.cloneMaxDirectionExposureUsdc) * weight * durationFactor, 2),
+    cloneMaxClipUsdc: round(cappedMaxClipUsdc, 2),
+    cloneMaxDirectionExposureUsdc: round(cappedDirectionExposureUsdc, 2),
     cloneEntryStartSec: entryStartSec,
     cloneEntryEndSec: entryEndSec,
+    cloneLateEntryBufferSec: lateEntryBufferSec,
     cloneOrderTtlSec: durationSec > 300 ? Math.max(num(opts.cloneOrderTtlSec), 125) : opts.cloneOrderTtlSec,
     cloneExitBeforeEndSec: durationSec > 300 ? Math.max(num(opts.cloneExitBeforeEndSec), 75) : opts.cloneExitBeforeEndSec,
     cloneProbeEnabled: isFiveMinute ? false : opts.cloneProbeEnabled,
@@ -1036,16 +1139,17 @@ function attachCloneLedgerReset(clone, reset) {
 }
 
 function ensureCloneVersion(state, opts) {
+  const strategyVersion = strategyVersionForOpts(opts);
   const currentId = state.cloneVersion?.id || "";
-  if (currentId !== STRATEGY_VERSION_ID) {
+  if (currentId !== strategyVersion.id) {
     if (state.clone?.market?.slug) archiveCloneWindow(state, state.clone, "strategy-version-reset");
     const nowSec = Math.floor(Date.now() / 1000);
     state.cloneVersion = {
-      id: STRATEGY_VERSION_ID,
-      name: STRATEGY_VERSION_NAME,
+      id: strategyVersion.id,
+      name: strategyVersion.name,
       startedAt: isoFromSec(nowSec),
       startSec: nowSec,
-      resetReason: "start isolated accounting after settlement-hold and flow-scale rules",
+      resetReason: "start isolated accounting after strategy version change",
     };
     state.cloneVersionCumulative = emptyCloneVersionCumulative(state.cloneVersion);
     state.clonePortfolio = null;
@@ -1055,6 +1159,11 @@ function ensureCloneVersion(state, opts) {
     attachCloneLedgerReset(state.clone, state.cloneLedgerReset);
     return true;
   }
+  if (state.cloneVersion) state.cloneVersion.name = strategyVersion.name;
+  if (state.cloneVersionCumulative?.versionId === strategyVersion.id) {
+    state.cloneVersionCumulative.versionName = strategyVersion.name;
+  }
+  normalizeStrategyVersionNames(state, strategyVersion);
   attachCloneVersion(state.clone, state.cloneVersion);
   return false;
 }
@@ -1617,6 +1726,9 @@ async function refreshCloneEngine(state, opts) {
       if (leg.key === "BTC5m") state.clone = clone;
       state.clonePortfolio.assets[leg.key] = clone;
     }
+    clone.enabled = Boolean(assetOpts.clone && slug);
+    clone.baseConfig = cloneConfig(assetOpts);
+    if (!clone.config) clone.config = clone.baseConfig;
     const isFiveMinute = leg.durationSec <= 300;
     const lastRefreshSec = num(clone.lastRefreshSec, 0);
     if (!isFiveMinute && lastRefreshSec && nowSec - lastRefreshSec < 8) continue;
@@ -1638,7 +1750,12 @@ async function refreshCloneEngine(state, opts) {
 
 async function refreshOneCloneEngine(state, clone, opts, nowSec) {
   clone.updatedAt = new Date().toISOString();
-  if (!clone.enabled) return;
+  if (!clone.enabled) {
+    clone.status = "disabled";
+    clone.lastError = "";
+    clone.config = clone.baseConfig || clone.config || cloneConfig(opts);
+    return;
+  }
   try {
     sanitizeCloneMinimumTradeArtifacts(clone, nowSec);
     if (!clone.market || clone.market.slug !== opts.slug || nowSec - num(clone.market.fetchedAtSec, 0) >= 30) {
@@ -1761,6 +1878,51 @@ function cloneSignalModel(clone, nowSec) {
   };
 }
 
+function cloneDirectionConfirmation(clone, signal, preferred) {
+  const cfg = clone.config || {};
+  if (!cfg.directionConfirmEnabled || !preferred) return { ok: true, reason: "direction gate disabled" };
+  const dir = preferred === "Up" ? 1 : -1;
+  const delta = num(signal?.deltaBps, 0);
+  const velocity = num(signal?.velocityBps, 0);
+  const bookLean = num(signal?.bookLeanBps, 0);
+  const signalBps = num(signal?.signalBps, 0);
+  const fairGap = preferred === "Up" ? num(signal?.fairUp) - 0.5 : 0.5 - num(signal?.fairUp);
+  const minSignal = Math.max(num(cfg.minSignalBps), num(cfg.directionMinSignalBps, cfg.minSignalBps));
+  const minDelta = num(cfg.directionMinDeltaBps, 2);
+  const minFairGap = num(cfg.directionMinFairGap, 0.025);
+  const maxVelocityOppose = num(cfg.directionMaxVelocityOpposeBps, 1.2);
+  const maxBookOppose = num(cfg.directionMaxBookOpposeBps, 1.6);
+  const deltaAligned = dir * delta >= minDelta;
+  const velocityAligned = dir * velocity >= Math.max(0.6, minDelta * 0.45);
+  const bookAligned = dir * bookLean >= 0;
+  const signalStrong = dir * signalBps >= minSignal;
+  const fairOk = fairGap >= minFairGap;
+  const velocityNotOpposing = dir * velocity >= -maxVelocityOppose;
+  const bookNotOpposing = dir * bookLean >= -maxBookOppose;
+  const directionBacked = deltaAligned || (velocityAligned && bookAligned);
+  const fairOverride = signalStrong
+    && deltaAligned
+    && fairGap >= Math.max(minFairGap * 3.2, 0.12)
+    && velocityNotOpposing
+    && dir * bookLean >= -maxBookOppose * 3.5;
+  const ok = Boolean(signalStrong && fairOk && directionBacked && velocityNotOpposing && (bookNotOpposing || fairOverride));
+  return {
+    ok,
+    preferred,
+    signalBps: round(signalBps, 4),
+    deltaBps: round(delta, 4),
+    velocityBps: round(velocity, 4),
+    bookLeanBps: round(bookLean, 4),
+    fairGap: round(fairGap, 6),
+    minSignal,
+    minDelta,
+    minFairGap,
+    reason: ok
+      ? `direction confirmed ${preferred}: signal ${round(signalBps, 2)} delta ${round(delta, 2)} velocity ${round(velocity, 2)} book ${round(bookLean, 2)}${fairOverride ? " fair-gap override" : ""}`
+      : `direction gate blocked ${preferred}: signal ${round(signalBps, 2)}/${round(minSignal, 2)}, delta ${round(delta, 2)}/${round(minDelta, 2)}, velocity ${round(velocity, 2)}, book ${round(bookLean, 2)}, fairGap ${round(fairGap, 4)}/${round(minFairGap, 4)}`,
+  };
+}
+
 function btcVelocityBps(btc, nowSec) {
   const samples = Array.isArray(btc?.samples) ? btc.samples : [];
   const latest = samples[samples.length - 1];
@@ -1837,6 +1999,36 @@ function losingDirectionCap(clone, outcome, directionTotal) {
   const tightenedCap = adverseRate >= 0.45 ? baseCap * 0.55 : baseCap;
   const hardLoss = pnl < -Math.max(num(cfg.orderUsdc, 1) * 4, directionTotal * 0.08);
   return hardLoss && directionTotal >= tightenedCap;
+}
+
+function liveRiskBudgetCapForCandidate(clone, candidate) {
+  const cfg = clone.config || {};
+  const budget = num(cfg.budgetUsdc);
+  if (!cfg.riskTrancheEnabled || budget <= 0) return budget;
+  const minOrder = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minFillUsdc, POLYMARKET_MIN_ORDER_USDC));
+  const openPnl = num(clone.pnl?.unrealized);
+  const directionPnl = directionOpenPnl(clone, candidate.outcome);
+  const adverse = clone.adverseSelection?.byDirection?.[candidate.outcome] || {};
+  const adverseRate = num(adverse.rate);
+  const signalAbs = Math.abs(num(candidate.signalBps));
+  const minEdge = Math.max(0.0001, num(cfg.minExpectedEdge, 0.02));
+  const edgeMultiple = num(candidate.edge) / minEdge;
+  const lossStop = Math.max(minOrder, num(cfg.windowLossStopUsdc, budget * 0.35));
+  const directionLossStop = Math.max(minOrder, num(cfg.directionLossStopUsdc, lossStop * 0.7));
+  if (openPnl < -lossStop || directionPnl < -directionLossStop) return 0;
+
+  let fraction = clamp(num(cfg.initialBudgetFraction, 1), 0.05, 1);
+  if (signalAbs >= num(cfg.highConfidenceBps) || edgeMultiple >= 1.8) {
+    fraction = Math.max(fraction, clamp(num(cfg.strongBudgetFraction, fraction), 0.05, 1));
+  }
+  if (directionPnl > Math.max(num(cfg.orderUsdc, minOrder) * 1.5, budget * 0.08)
+      || openPnl > Math.max(num(cfg.orderUsdc, minOrder) * 2, budget * 0.1)) {
+    fraction = Math.max(fraction, clamp(num(cfg.profitBudgetFraction, 1), 0.05, 1));
+  }
+  if (adverseRate >= 0.5 || num(adverse.avgBps) <= -180) {
+    fraction = Math.min(fraction, clamp(num(cfg.adverseBudgetFraction, fraction), 0.05, 1));
+  }
+  return round(clamp(budget * fraction, minOrder, budget), 2);
 }
 
 function minCloneOrderNotional(clone, outcome, effectivePrice) {
@@ -1924,7 +2116,7 @@ function cloneSellProceeds(clone) {
 function clonePending(clone) {
   return round((clone.orders || [])
     .filter((order) => ["OPEN", "PARTIAL"].includes(order.status))
-    .reduce((total, order) => total + num(order.limitPrice) * remainingOrderShares(order), 0), 6);
+    .reduce((total, order) => total + remainingOrderNotional(order), 0), 6);
 }
 
 function enforceCloneBudgetCaps(clone, nowSec) {
@@ -1956,10 +2148,19 @@ function remainingOrderShares(order) {
   return Math.max(0, remaining);
 }
 
+function remainingOrderNotional(order) {
+  const remaining = remainingOrderShares(order);
+  const shares = num(order.shares);
+  if (shares > 0 && Number.isFinite(num(order.notional, NaN))) {
+    return round(num(order.notional) * remaining / shares, 6);
+  }
+  return round(num(order.limitPrice) * remaining, 6);
+}
+
 function pendingByDirection(clone, outcome) {
   return round((clone.orders || [])
     .filter((order) => order.direction === outcome && ["OPEN", "PARTIAL"].includes(order.status))
-    .reduce((total, order) => total + num(order.limitPrice) * remainingOrderShares(order), 0), 6);
+    .reduce((total, order) => total + remainingOrderNotional(order), 0), 6);
 }
 
 function visibleAskDepthUsdc(quote, limitPrice) {
@@ -2132,6 +2333,13 @@ function learnBonereaperStrategy(state, clone, nowSec) {
   }
   if (Number.isFinite(medianBuyUsdc)) suggested.medianBuyUsdc = round(medianBuyUsdc, 6);
   if (Number.isFinite(p75BuyUsdc)) suggested.p75BuyUsdc = round(p75BuyUsdc, 6);
+  const safeNotes = [];
+  if (Number.isFinite(firstBuyElapsedSec) && Number.isFinite(lastBuyElapsedSec)) {
+    safeNotes.push(`observed entry window ${round(firstBuyElapsedSec, 1)}s-${round(lastBuyElapsedSec, 1)}s`);
+  }
+  if (buys.length) {
+    safeNotes.push(`observed buys ${buys.length}, recent30s ${recentBuys.length}, peak1s ${burstPeak1s}`);
+  }
   clone.learner = {
     enabled: true,
     slug,
@@ -2155,10 +2363,789 @@ function learnBonereaperStrategy(state, clone, nowSec) {
     medianWindowBuyUsdc: Number.isFinite(medianWindowBuyUsdc) ? round(medianWindowBuyUsdc, 6) : null,
     p75WindowBuyRows: Number.isFinite(p75WindowBuyRows) ? round(p75WindowBuyRows, 3) : null,
     suggested,
-    notes,
+    notes: safeNotes,
     updatedAt: isoFromSec(nowSec),
   };
   return clone.learner;
+}
+
+function applyCloneLegCapConfig(clone, cfg, adjustments, suggestions) {
+  const cap = finiteNum(cfg.legCapUsdc, null);
+  if (cap === null) return;
+  const safeCap = round(Math.max(0, cap), 2);
+  cfg.legCapUsdc = safeCap;
+  cfg.budgetUsdc = round(Math.min(num(cfg.budgetUsdc), safeCap), 2);
+  cfg.maxDirectionExposureUsdc = round(Math.min(num(cfg.maxDirectionExposureUsdc), safeCap), 2);
+  cfg.maxClipUsdc = round(Math.min(num(cfg.maxClipUsdc), Math.max(POLYMARKET_MIN_ORDER_USDC, safeCap)), 2);
+  if (safeCap < POLYMARKET_MIN_ORDER_USDC) {
+    cfg.budgetUsdc = 0;
+    cfg.orderUsdc = POLYMARKET_MIN_ORDER_USDC;
+    cfg.probeOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+    cfg.maxClipUsdc = 0;
+    cfg.maxDirectionExposureUsdc = 0;
+    cfg.probeEnabled = false;
+    cfg.targetOrderRows = 0;
+    clone.enabled = false;
+    suggestions.push("leg cap is 0U; this leg is observation-only for the 50U run");
+  } else {
+    cfg.orderUsdc = round(Math.min(Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.orderUsdc)), safeCap), 2);
+    cfg.probeOrderUsdc = round(Math.min(Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.probeOrderUsdc)), safeCap), 2);
+    suggestions.push(`hard leg cap applied at ${safeCap}U for bankroll sizing`);
+  }
+  Object.assign(adjustments, {
+    legCapUsdc: cfg.legCapUsdc,
+    budgetUsdc: cfg.budgetUsdc,
+    orderUsdc: cfg.orderUsdc,
+    probeOrderUsdc: cfg.probeOrderUsdc,
+    maxClipUsdc: cfg.maxClipUsdc,
+    maxDirectionExposureUsdc: cfg.maxDirectionExposureUsdc,
+  });
+}
+
+function performanceStats(rows) {
+  const cost = rows.reduce((total, row) => total + num(row.cost), 0);
+  const pnl = rows.reduce((total, row) => total + num(row.pnl), 0);
+  const wins = rows.filter((row) => num(row.pnl) > 0).length;
+  const losses = rows.filter((row) => num(row.pnl) < 0).length;
+  const adverseRows = rows.filter((row) => Number.isFinite(num(row.adverseSelection?.rate, NaN)));
+  const adverseRate = adverseRows.length
+    ? adverseRows.reduce((total, row) => total + num(row.adverseSelection?.rate), 0) / adverseRows.length
+    : 0;
+  let lossStreak = 0;
+  for (const row of rows) {
+    if (num(row.pnl) < 0) lossStreak += 1;
+    else break;
+  }
+  return {
+    rows: rows.length,
+    cost,
+    pnl,
+    wins,
+    losses,
+    winRate: rows.length ? wins / rows.length : 0,
+    returnPct: cost > 0 ? pnl / cost : 0,
+    adverseRate,
+    lossStreak,
+  };
+}
+
+function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions) {
+  const bankroll = num(cfg.bankrollUsdc, 0);
+  if (bankroll <= 0 || bankroll > 100) return;
+  const legKey = clone.legKey || slugLegKey(clone.market?.slug);
+  if (!legKey) return;
+  const sameVersion = (row) => (
+    String(row.strategyVersionId || "") === String(clone.strategyVersionId || STRATEGY_VERSION_ID)
+    && (!clone.ledgerResetId || String(row.ledgerResetId || "") === String(clone.ledgerResetId))
+  );
+  const legRows = (state.cloneHistory || [])
+    .filter((row) => sameVersion(row) && String(row.legKey || slugLegKey(row.slug)) === String(legKey) && num(row.cost) > 0);
+  const portfolioRows = (state.cloneHistory || [])
+    .filter((row) => sameVersion(row) && num(row.cost) > 0);
+  const recent6 = performanceStats(legRows.slice(0, 6));
+  const recent12 = performanceStats(legRows.slice(0, 12));
+  const portfolio = performanceStats(portfolioRows);
+  const legCap = finiteNum(cfg.legCapUsdc, null) ?? Math.max(POLYMARKET_MIN_ORDER_USDC, bankroll * 0.25);
+  if (legCap < POLYMARKET_MIN_ORDER_USDC) return;
+
+  const isEth = (clone.asset || slugAsset(clone.market?.slug)) === "ETH";
+  const horizon = clone.horizon || slugHorizon(clone.market?.slug);
+  const is15m = horizon === "15m";
+  const is5m = horizon === "5m";
+  const drawdownPct = portfolio.pnl < 0 ? Math.abs(portfolio.pnl) / Math.max(POLYMARKET_MIN_ORDER_USDC, bankroll) : 0;
+  const legBad = recent6.rows >= 4 && (
+    recent6.pnl < -Math.max(0.75, recent6.cost * 0.18)
+    || (recent6.losses >= 4 && recent6.pnl < 0)
+    || (recent6.winRate < 0.38 && recent6.pnl < 0)
+    || (recent6.adverseRate >= 0.7 && recent6.pnl < 0)
+  );
+  const legRecovering = recent12.rows >= 8
+    && recent12.pnl > Math.max(0.5, recent12.cost * 0.015)
+    && recent12.winRate >= 0.5
+    && recent6.winRate >= 0.5
+    && recent6.pnl > 0;
+
+  const profile = is5m
+    ? (isEth
+      ? {
+        starterBudget: 1,
+        starterRows: 1,
+        starterClip: 1,
+        starterEdge: 0.072,
+        starterSignal: 7.2,
+        starterMaxAsk: 0.78,
+        starterDepth: 5,
+        starterParticipation: 0.06,
+        probeBudget: 1,
+        probeRows: 1,
+        probeClip: 1,
+        probeEdge: 0.085,
+        probeSignal: 8.2,
+        probeMaxAsk: 0.75,
+        probeDepth: 6,
+        probeParticipation: 0.05,
+        scaleBudget: 1,
+        scaleRows: 1,
+        scaleClip: 1,
+        scaleEdge: 0.066,
+        scaleSignal: 6.8,
+        scaleMaxAsk: 0.8,
+        scaleDepth: 5,
+        scaleParticipation: 0.07,
+      }
+      : {
+        starterBudget: 2,
+        starterRows: 3,
+        starterClip: 1,
+        starterEdge: 0.024,
+        starterSignal: 3,
+        starterMaxAsk: 0.87,
+        starterDepth: 2,
+        starterParticipation: 0.12,
+        probeBudget: 1,
+        probeRows: 2,
+        probeClip: 1,
+        probeEdge: 0.022,
+        probeSignal: 3.2,
+        probeMaxAsk: 0.84,
+        probeDepth: 2.5,
+        probeParticipation: 0.09,
+        scaleBudget: 3,
+        scaleRows: 4,
+        scaleClip: 1,
+        scaleEdge: 0.022,
+        scaleSignal: 4.4,
+        scaleMaxAsk: 0.88,
+        scaleDepth: 2,
+        scaleParticipation: 0.16,
+      })
+    : (isEth
+      ? {
+        starterBudget: 2,
+        starterRows: 2,
+        starterClip: 1,
+        starterEdge: 0.058,
+        starterSignal: 6.4,
+        starterMaxAsk: 0.82,
+        starterDepth: 4.8,
+        starterParticipation: 0.08,
+        probeBudget: 1,
+        probeRows: 1,
+        probeClip: 1,
+        probeEdge: 0.075,
+        probeSignal: 7.8,
+        probeMaxAsk: 0.78,
+        probeDepth: 5.5,
+        probeParticipation: 0.06,
+        scaleBudget: 3,
+        scaleRows: 2,
+        scaleClip: 1.25,
+        scaleEdge: 0.052,
+        scaleSignal: 5.6,
+        scaleMaxAsk: 0.84,
+        scaleDepth: 4.2,
+        scaleParticipation: 0.12,
+      }
+      : {
+        starterBudget: 3,
+        starterRows: 3,
+        starterClip: 1.2,
+        starterEdge: 0.048,
+        starterSignal: 5,
+        starterMaxAsk: 0.86,
+        starterDepth: 3.5,
+        starterParticipation: 0.1,
+        probeBudget: 2,
+        probeRows: 2,
+        probeClip: 1,
+        probeEdge: 0.064,
+        probeSignal: 6.6,
+        probeMaxAsk: 0.82,
+        probeDepth: 4.8,
+        probeParticipation: 0.08,
+        scaleBudget: 3,
+        scaleRows: 4,
+        scaleClip: 1.5,
+        scaleEdge: 0.042,
+        scaleSignal: 4.5,
+        scaleMaxAsk: 0.88,
+        scaleDepth: 3.5,
+        scaleParticipation: 0.18,
+      });
+
+  let mode = "starter";
+  let budget = Math.min(legCap, profile.starterBudget);
+  let targetRows = profile.starterRows;
+  let maxClip = profile.starterClip;
+  let minExpectedEdge = profile.starterEdge;
+  let minSignalBps = profile.starterSignal;
+  let maxAsk = profile.starterMaxAsk;
+  let minVisibleDepth = profile.starterDepth;
+  let participation = profile.starterParticipation;
+
+  if (drawdownPct >= 0.7) {
+    mode = "rescue";
+    budget = POLYMARKET_MIN_ORDER_USDC;
+    targetRows = 1;
+    maxClip = POLYMARKET_MIN_ORDER_USDC;
+    minExpectedEdge = Math.max(profile.probeEdge, is5m ? 0.085 : 0.075);
+    minSignalBps = Math.max(profile.probeSignal, is5m ? 8 : 7.2);
+    maxAsk = Math.min(profile.probeMaxAsk, is5m ? 0.78 : 0.8);
+    minVisibleDepth = Math.max(profile.probeDepth, is5m ? 6 : 5);
+    participation = Math.min(profile.probeParticipation, 0.06);
+  } else if (drawdownPct >= 0.35 || legBad) {
+    mode = "probe";
+    budget = Math.min(legCap, profile.probeBudget);
+    targetRows = profile.probeRows;
+    maxClip = profile.probeClip;
+    minExpectedEdge = profile.probeEdge;
+    minSignalBps = profile.probeSignal;
+    maxAsk = profile.probeMaxAsk;
+    minVisibleDepth = profile.probeDepth;
+    participation = profile.probeParticipation;
+  } else if (legRecovering) {
+    mode = "scale";
+    budget = Math.min(legCap, profile.scaleBudget);
+    targetRows = profile.scaleRows;
+    maxClip = profile.scaleClip;
+    minExpectedEdge = profile.scaleEdge;
+    minSignalBps = profile.scaleSignal;
+    maxAsk = profile.scaleMaxAsk;
+    minVisibleDepth = profile.scaleDepth;
+    participation = profile.scaleParticipation;
+  }
+  budget = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(legCap, budget)), 2);
+  maxClip = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(legCap, maxClip)), 2);
+
+  cfg.allowLearnedProbe = false;
+  cfg.directionConfirmEnabled = true;
+  cfg.directionMinSignalBps = round(Math.max(num(cfg.minSignalBps), is5m ? (isEth ? 4.2 : 3.2) : (isEth ? 7.2 : 5.6)), 3);
+  cfg.directionMinDeltaBps = round(isEth ? (is5m ? 3.6 : 6.4) : (is5m ? 2.8 : 5.2), 3);
+  cfg.directionMinFairGap = round(isEth ? (is5m ? 0.034 : 0.064) : (is5m ? 0.022 : 0.052), 4);
+  cfg.directionMaxVelocityOpposeBps = round(isEth ? (is5m ? 1.4 : 0.6) : (is5m ? 1.2 : 0.9), 3);
+  cfg.directionMaxBookOpposeBps = round(isEth ? (is5m ? 1.1 : 0.8) : (is5m ? 1.4 : 1.1), 3);
+  for (let i = suggestions.length - 1; i >= 0; i -= 1) {
+    if (String(suggestions[i]).includes("using Bonereaper public trades")) suggestions.splice(i, 1);
+  }
+  cfg.budgetUsdc = budget;
+  cfg.maxDirectionExposureUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(Math.max(num(cfg.maxDirectionExposureUsdc), POLYMARKET_MIN_ORDER_USDC), Math.max(POLYMARKET_MIN_ORDER_USDC, budget)),
+  ), 2);
+  cfg.orderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.probeOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.maxClipUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(Math.max(num(cfg.maxClipUsdc), POLYMARKET_MIN_ORDER_USDC), maxClip)), 2);
+  cfg.targetOrderRows = Math.max(1, Math.min(num(cfg.targetOrderRows, targetRows) || targetRows, targetRows));
+  cfg.minExpectedEdge = round(Math.max(num(cfg.minExpectedEdge), minExpectedEdge), 4);
+  cfg.probeMinExpectedEdge = round(Math.max(num(cfg.probeMinExpectedEdge, 0.008), minExpectedEdge * 0.7), 4);
+  cfg.minSignalBps = round(Math.max(num(cfg.minSignalBps), minSignalBps), 3);
+  cfg.maxAsk = round(Math.min(num(cfg.maxAsk), maxAsk), 3);
+  cfg.highConfidenceMaxAsk = round(Math.max(num(cfg.maxAsk), isEth ? (is5m ? 0.89 : 0.86) : (is5m ? 0.92 : 0.9)), 3);
+  cfg.minVisibleDepthUsdc = round(Math.max(num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC), minVisibleDepth), 3);
+  cfg.liquidityParticipation = round(Math.min(num(cfg.liquidityParticipation, 0.35), participation), 3);
+  cfg.orderTtlSec = is5m ? Math.min(num(cfg.orderTtlSec, 75), mode === "scale" ? 75 : 45) : Math.min(num(cfg.orderTtlSec, 75), 90);
+  cfg.minFillPrice = round(Math.max(num(cfg.minFillPrice, 0.01), isEth ? 0.1 : 0.08), 3);
+  cfg.smallBankrollMakerOnly = Boolean(mode !== "scale" || is5m);
+  cfg.riskTrancheEnabled = true;
+  cfg.exitEnabled = true;
+  cfg.exitFlipBps = round(is5m ? (isEth ? 5.4 : 4.6) : (isEth ? 6.2 : 4.8), 3);
+  cfg.exitStopLossPct = round(is5m ? (isEth ? 0.18 : 0.16) : (isEth ? 0.22 : 0.18), 3);
+  cfg.exitBeforeEndSec = Math.max(num(cfg.exitBeforeEndSec), is5m ? 35 : 80);
+  cfg.initialBudgetFraction = round(is5m ? 1 : 0.7, 3);
+  cfg.profitBudgetFraction = round(is5m ? 1 : 0.9, 3);
+  cfg.adverseBudgetFraction = round(isEth ? 0.18 : 0.24, 3);
+  cfg.windowLossStopUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.directionLossStopUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.maxOrdersPerWindow = cfg.targetOrderRows;
+  cfg.smallBankrollMode = mode;
+  cfg.smallBankrollStats = {
+    bankroll,
+    legKey,
+    drawdownPct: round(drawdownPct * 100, 2),
+    recent6Pnl: round(recent6.pnl, 4),
+    recent6WinRate: round(recent6.winRate * 100, 2),
+    recent6AdverseRate: round(recent6.adverseRate * 100, 2),
+    recent12Pnl: round(recent12.pnl, 4),
+    recent12WinRate: round(recent12.winRate * 100, 2),
+    portfolioPnl: round(portfolio.pnl, 4),
+  };
+  Object.assign(adjustments, {
+    smallBankrollMode: cfg.smallBankrollMode,
+    smallBankrollStats: cfg.smallBankrollStats,
+    allowLearnedProbe: cfg.allowLearnedProbe,
+    directionConfirmEnabled: cfg.directionConfirmEnabled,
+    directionMinSignalBps: cfg.directionMinSignalBps,
+    directionMinDeltaBps: cfg.directionMinDeltaBps,
+    directionMinFairGap: cfg.directionMinFairGap,
+    directionMaxVelocityOpposeBps: cfg.directionMaxVelocityOpposeBps,
+    directionMaxBookOpposeBps: cfg.directionMaxBookOpposeBps,
+    budgetUsdc: cfg.budgetUsdc,
+    maxDirectionExposureUsdc: cfg.maxDirectionExposureUsdc,
+    orderUsdc: cfg.orderUsdc,
+    probeOrderUsdc: cfg.probeOrderUsdc,
+    maxClipUsdc: cfg.maxClipUsdc,
+    targetOrderRows: cfg.targetOrderRows,
+    minExpectedEdge: cfg.minExpectedEdge,
+    probeMinExpectedEdge: cfg.probeMinExpectedEdge,
+    minSignalBps: cfg.minSignalBps,
+    maxAsk: cfg.maxAsk,
+    highConfidenceMaxAsk: cfg.highConfidenceMaxAsk,
+    minVisibleDepthUsdc: cfg.minVisibleDepthUsdc,
+    liquidityParticipation: cfg.liquidityParticipation,
+    orderTtlSec: cfg.orderTtlSec,
+    minFillPrice: cfg.minFillPrice,
+    smallBankrollMakerOnly: cfg.smallBankrollMakerOnly,
+    riskTrancheEnabled: cfg.riskTrancheEnabled,
+    exitEnabled: cfg.exitEnabled,
+    exitFlipBps: cfg.exitFlipBps,
+    exitStopLossPct: cfg.exitStopLossPct,
+    exitBeforeEndSec: cfg.exitBeforeEndSec,
+    initialBudgetFraction: cfg.initialBudgetFraction,
+    profitBudgetFraction: cfg.profitBudgetFraction,
+    adverseBudgetFraction: cfg.adverseBudgetFraction,
+    windowLossStopUsdc: cfg.windowLossStopUsdc,
+    directionLossStopUsdc: cfg.directionLossStopUsdc,
+    maxOrdersPerWindow: cfg.maxOrdersPerWindow,
+  });
+  suggestions.push("50U guardian disables learned-probe entries; Bonereaper flow is diagnostic only");
+  if (cfg.smallBankrollMakerOnly) suggestions.push("50U safe-frequency mode: weak signals use maker-only 1U probes; crossing needs high confidence");
+  suggestions.push(`50U safe-frequency ${mode}: ${legKey} rows ${cfg.targetOrderRows}, budget ${cfg.budgetUsdc}U, loss stop ${cfg.windowLossStopUsdc}U, recent6 pnl ${round(recent6.pnl, 2)}U`);
+}
+
+function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
+  const bankroll = num(cfg.bankrollUsdc, 0);
+  if (bankroll > 0 && bankroll <= 100) return;
+  const legKey = clone.legKey || slugLegKey(clone.market?.slug);
+  const leg = cryptoLegForKey(legKey);
+  if (!leg) return;
+
+  const sameVersion = (row) => (
+    String(row.strategyVersionId || "") === String(clone.strategyVersionId || STRATEGY_VERSION_ID)
+    && (!clone.ledgerResetId || String(row.ledgerResetId || "") === String(clone.ledgerResetId))
+  );
+  const legRows = (state.cloneHistory || [])
+    .filter((row) => sameVersion(row) && String(row.legKey || slugLegKey(row.slug)) === String(legKey) && num(row.cost) > 0);
+  const portfolioRows = (state.cloneHistory || []).filter((row) => sameVersion(row) && num(row.cost) > 0);
+  const sameReset = (row) => (!clone.ledgerResetId || String(row.ledgerResetId || "") === String(clone.ledgerResetId));
+  const allLegRows = (state.cloneHistory || [])
+    .filter((row) => sameReset(row) && String(row.legKey || slugLegKey(row.slug)) === String(legKey) && num(row.cost) > 0);
+  const allPortfolioRows = (state.cloneHistory || []).filter((row) => sameReset(row) && num(row.cost) > 0);
+  const qualityLegRows = legRows.length >= 8 ? legRows : allLegRows;
+  const qualityPortfolioRows = portfolioRows.length >= 12 ? portfolioRows : allPortfolioRows;
+  const recent8 = performanceStats(qualityLegRows.slice(0, 8));
+  const recent24 = performanceStats(qualityLegRows.slice(0, 24));
+  const portfolio = performanceStats(qualityPortfolioRows);
+  const directionStats = (rows) => {
+    const settled = rows.filter((row) => OUTCOMES.includes(row.winner));
+    const hits = settled.filter((row) => cloneDirectionPrediction(row) === row.winner).length;
+    return { rows: settled.length, hits, hitRate: settled.length ? hits / settled.length : 0 };
+  };
+  const quality12 = performanceStats(qualityLegRows.slice(0, 12));
+  const qualityDirection12 = directionStats(qualityLegRows.slice(0, 12));
+
+  const is15m = leg.horizon === "15m";
+  const isEth = leg.asset === "ETH";
+  const profile = {
+    BTC5m: { budget: 7, scaleBudget: 12, rescueBudget: 2, targetRows: 8, scaleRows: 14, clip: 1.4, scaleClip: 2, minEdge: 0.04, minSignal: 4.2, maxAsk: 0.84, highAsk: 0.9, minDepth: 4, participation: 0.12 },
+    BTC15m: { budget: 44, scaleBudget: 70, rescueBudget: 10, targetRows: 34, scaleRows: 58, clip: 2.2, scaleClip: 3.2, minEdge: 0.036, minSignal: 3.6, maxAsk: 0.88, highAsk: 0.93, minDepth: 5.5, participation: 0.16 },
+    ETH5m: { budget: 4, scaleBudget: 6, rescueBudget: 1, targetRows: 4, scaleRows: 6, clip: 1.1, scaleClip: 1.5, minEdge: 0.06, minSignal: 5.8, maxAsk: 0.8, highAsk: 0.86, minDepth: 5, participation: 0.08 },
+    ETH15m: { budget: 26, scaleBudget: 42, rescueBudget: 6, targetRows: 18, scaleRows: 32, clip: 1.8, scaleClip: 2.6, minEdge: 0.046, minSignal: 4.2, maxAsk: 0.86, highAsk: 0.9, minDepth: 5.5, participation: 0.12 },
+  }[legKey];
+  if (!profile) return;
+
+  const recent24WinPnls = legRows.slice(0, 24).map((row) => num(row.pnl)).filter((pnl) => pnl > 0);
+  const recent24LossPnls = legRows.slice(0, 24).map((row) => num(row.pnl)).filter((pnl) => pnl < 0);
+  const avgWinPnl = recent24WinPnls.length
+    ? recent24WinPnls.reduce((total, pnl) => total + pnl, 0) / recent24WinPnls.length
+    : 0;
+  const avgLossAbs = recent24LossPnls.length
+    ? Math.abs(recent24LossPnls.reduce((total, pnl) => total + pnl, 0) / recent24LossPnls.length)
+    : 0;
+  const lossAsymmetryHot = recent24.rows >= 6
+    && recent24.losses >= 2
+    && avgLossAbs > Math.max(profile.clip * 1.7, avgWinPnl * 1.2);
+  const qualityGate = quality12.rows >= 6
+    && qualityDirection12.rows >= 6
+    && quality12.winRate >= 0.55
+    && qualityDirection12.hitRate >= 0.55
+    && quality12.pnl > 0
+    && !lossAsymmetryHot;
+  const weakQuality = quality12.rows >= 8 && (
+    quality12.winRate < 0.55
+    || qualityDirection12.hitRate < 0.55
+    || quality12.pnl <= 0
+  );
+  const learner = clone.learner || {};
+  const observedRows = num(learner.currentObservedBuys);
+  const observedUsdc = num(learner.currentBuyUsdc);
+  const recentFlowRows = num(learner.recentBuyRows30s);
+  const burstPeak = num(learner.burstPeak1s);
+  const medianWindowUsdc = num(learner.medianWindowBuyUsdc);
+  const medianBuyUsdc = num(learner.medianBuyUsdc, NaN);
+  const learnedPreferred = learner.preferredOutcome || "";
+  const learnedActive = observedRows > 0 && learnedPreferred;
+  const flowLearningHot = Boolean(learnedActive && (
+    recentFlowRows >= (is15m ? 2 : 1)
+    || burstPeak >= 2
+    || observedRows >= (is15m ? 10 : 4)
+    || observedUsdc >= (is15m ? 75 : 25)
+  ));
+  const currentUnrealized = num(clone.pnl?.unrealized);
+  const adverse = clone.adverseSelection || {};
+  const currentAdverseHot = num(adverse.checked) >= 8 && num(adverse.rate) >= (isEth ? 0.58 : 0.65);
+  const legDrawdown = recent8.rows >= 4 && (
+    recent8.pnl < -Math.max(8, recent8.cost * 0.035)
+    || recent8.losses >= 5
+    || recent8.winRate < 0.45
+    || recent8.adverseRate >= (isEth ? 0.62 : 0.72)
+  );
+  const portfolioDrawdown = portfolio.rows >= 8 && portfolio.pnl < -Math.max(20, portfolio.cost * 0.025);
+  const recovering = recent24.rows >= 12
+    && recent24.pnl > Math.max(12, recent24.cost * 0.025)
+    && recent24.winRate >= 0.52
+    && recent8.pnl > 0
+    && recent8.winRate >= 0.5
+    && recent8.adverseRate < 0.55
+    && !lossAsymmetryHot;
+  let mode = "base";
+  let budget = profile.budget;
+  let targetRows = profile.targetRows;
+  let maxClip = profile.clip;
+  let minEdge = profile.minEdge;
+  let minSignal = profile.minSignal;
+  let maxAsk = profile.maxAsk;
+  let minDepth = profile.minDepth;
+  let participation = profile.participation;
+  let orderCap = Math.max(POLYMARKET_MIN_ORDER_USDC, isEth ? 2 : 1.8);
+  let probeSize = POLYMARKET_MIN_ORDER_USDC;
+  let qualityScaleActive = false;
+  const hardRisk = portfolioDrawdown
+    || legDrawdown
+    || lossAsymmetryHot
+    || currentAdverseHot
+    || currentUnrealized < -Math.max(4, profile.budget * (isEth ? 0.18 : 0.12));
+  const scoutHardBlock = portfolioDrawdown
+    || lossAsymmetryHot
+    || currentAdverseHot
+    || currentUnrealized < -Math.max(4, profile.budget * (isEth ? 0.18 : 0.12));
+  const fifteenMinuteScoutEligible = false;
+
+  if (hardRisk) {
+    mode = "defensive";
+    budget = Math.max(POLYMARKET_MIN_ORDER_USDC, profile.rescueBudget);
+    targetRows = is15m ? Math.max(4, Math.floor(profile.targetRows * 0.22)) : Math.max(1, Math.floor(profile.targetRows * 0.35));
+    maxClip = Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(profile.clip * 0.45, isEth ? 1.4 : 1.3));
+    minEdge = profile.minEdge + (isEth ? 0.025 : 0.026);
+    minSignal = profile.minSignal + (isEth ? 1.8 : 1.7);
+    maxAsk = Math.min(profile.maxAsk, isEth ? 0.78 : 0.84);
+    minDepth = Math.max(profile.minDepth, isEth ? 6 : 8);
+    participation = Math.min(profile.participation, isEth ? 0.08 : 0.07);
+  } else if (weakQuality) {
+    mode = "quality-watch";
+    budget = round(Math.max(profile.budget, profile.scaleBudget * (is15m ? 0.72 : 0.78)), 2);
+    targetRows = Math.max(
+      is15m ? 16 : 5,
+      Math.floor(profile.targetRows * (isEth ? 0.72 : 0.82)),
+    );
+    maxClip = round(Math.max(profile.clip, profile.scaleClip * (is15m ? 1.15 : 1)), 2);
+    orderCap = round(Math.max(orderCap, is15m ? (isEth ? 5 : 8) : (isEth ? 2.4 : 3.5)), 2);
+    probeSize = round(Math.max(POLYMARKET_MIN_ORDER_USDC, orderCap * 0.28), 2);
+    minEdge = round(profile.minEdge + (isEth ? 0.012 : 0.01), 4);
+    minSignal = round(profile.minSignal + (isEth ? 0.8 : 0.65), 3);
+    maxAsk = round(Math.min(profile.highAsk || profile.maxAsk, profile.maxAsk + (is15m ? 0.018 : 0.012)), 3);
+    minDepth = round(Math.max(profile.minDepth, isEth ? 5.5 : 6), 3);
+    participation = round(Math.min(isEth ? 0.18 : 0.22, Math.max(profile.participation, is15m ? 0.18 : 0.16)), 3);
+  } else if (recovering) {
+    mode = "measured-scale";
+    budget = profile.scaleBudget;
+    targetRows = profile.scaleRows;
+    maxClip = profile.scaleClip;
+    minEdge = Math.max(0.028, profile.minEdge - 0.006);
+    minSignal = Math.max(2.8, profile.minSignal - 0.4);
+  }
+  if (flowLearningHot && mode !== "defensive") {
+    const flowBudget = Math.max(
+      profile.budget,
+      observedUsdc > 0 ? observedUsdc * (is15m ? 0.055 : 0.04) : 0,
+      medianWindowUsdc > 0 ? medianWindowUsdc * (is15m ? 0.04 : 0.03) : 0,
+      observedRows * (is15m ? 1.35 : 1.1),
+    );
+    mode = recovering ? "learn-scale" : "learn-hold";
+    budget = round(clamp(flowBudget, profile.budget, profile.scaleBudget), 2);
+    targetRows = Math.round(clamp(
+      Math.max(targetRows, observedRows * (is15m ? 0.55 : 0.45), recentFlowRows * (is15m ? 8 : 5)),
+      profile.targetRows,
+      profile.scaleRows,
+    ));
+    maxClip = Number.isFinite(medianBuyUsdc) && medianBuyUsdc > 0
+      ? round(clamp(medianBuyUsdc * (is15m ? 0.2 : 0.16), profile.clip, profile.scaleClip), 2)
+      : maxClip;
+    minEdge = round(Math.max(is15m ? 0.024 : 0.03, minEdge - (is15m ? 0.008 : 0.006)), 4);
+    minSignal = round(Math.max(is15m ? 2.8 : 3.4, minSignal - (is15m ? 0.7 : 0.5)), 3);
+    maxAsk = Math.min(profile.highAsk || profile.maxAsk, maxAsk + (is15m ? 0.035 : 0.025));
+    participation = Math.min(isEth ? 0.2 : 0.24, Math.max(participation, profile.participation * 1.35));
+  }
+  if (qualityGate && mode !== "defensive") {
+    const qualityBudget = Math.max(
+      budget,
+      profile.scaleBudget,
+      observedUsdc > 0 ? observedUsdc * (is15m ? 0.18 : 0.12) : 0,
+      medianWindowUsdc > 0 ? medianWindowUsdc * (is15m ? 0.16 : 0.1) : 0,
+      quality12.cost > 0 ? quality12.cost * (is15m ? 0.9 : 0.65) : 0,
+      observedRows * (is15m ? 4.5 : 2.8),
+    );
+    mode = "quality-1000u";
+    qualityScaleActive = true;
+    budget = round(clamp(qualityBudget, Math.max(profile.scaleBudget, budget), 1000), 2);
+    targetRows = Math.round(clamp(
+      Math.max(targetRows, profile.scaleRows * 1.35, observedRows * (is15m ? 0.8 : 0.65), recentFlowRows * (is15m ? 12 : 8)),
+      profile.scaleRows,
+      is15m ? 220 : 90,
+    ));
+    const qualityClip = Math.max(
+      maxClip,
+      profile.scaleClip * 2.5,
+      Number.isFinite(medianBuyUsdc) && medianBuyUsdc > 0 ? medianBuyUsdc * (is15m ? 0.75 : 0.55) : 0,
+      budget / Math.max(3, is15m ? 6 : 10),
+    );
+    maxClip = round(clamp(qualityClip, profile.scaleClip, 1000), 2);
+    orderCap = round(clamp(
+      Math.max(orderCap, maxClip, Number.isFinite(medianBuyUsdc) && medianBuyUsdc > 0 ? medianBuyUsdc * (is15m ? 0.65 : 0.45) : 0),
+      POLYMARKET_MIN_ORDER_USDC,
+      1000,
+    ), 2);
+    probeSize = round(clamp(Math.max(POLYMARKET_MIN_ORDER_USDC, orderCap * 0.22), POLYMARKET_MIN_ORDER_USDC, Math.min(orderCap, 250)), 2);
+    minEdge = round(Math.max(is15m ? 0.018 : 0.026, minEdge - (is15m ? 0.012 : 0.008)), 4);
+    minSignal = round(Math.max(is15m ? 2.2 : 3.0, minSignal - (is15m ? 1.0 : 0.7)), 3);
+    maxAsk = Math.min(0.96, Math.max(maxAsk, profile.highAsk || maxAsk));
+    participation = Math.min(isEth ? 0.34 : 0.42, Math.max(participation, profile.participation * 1.9));
+  }
+
+  cfg.liveReadyMode = mode;
+  cfg.directionConfirmEnabled = true;
+  cfg.parentConfirmOnly = !is15m;
+  cfg.allowLearnedProbe = flowLearningHot;
+  cfg.allowComboEntry = false;
+  cfg.flowConfirmEnabled = true;
+  cfg.probeEnabled = flowLearningHot || qualityScaleActive;
+  cfg.probeMaxPerCycle = cfg.probeEnabled ? Math.max(4, Math.min(qualityScaleActive ? 80 : 42, Math.floor(targetRows * 0.65))) : 0;
+  cfg.inventoryRebalanceRatio = flowLearningHot && is15m ? 0.12 : 0;
+  cfg.hedgeEnabled = false;
+  cfg.hedgeMaxAsk = 0;
+  cfg.exitEnabled = true;
+  cfg.budgetUsdc = qualityScaleActive ? round(budget, 2) : round(Math.min(num(cfg.budgetUsdc), budget), 2);
+  const exposureFraction = is15m ? (isEth ? 0.62 : 0.48) : (isEth ? 0.58 : 0.52);
+  const exposureTarget = Math.max(POLYMARKET_MIN_ORDER_USDC, budget * exposureFraction, qualityScaleActive ? maxClip : 0);
+  cfg.maxDirectionExposureUsdc = qualityScaleActive
+    ? round(Math.min(1000, exposureTarget), 2)
+    : round(Math.min(num(cfg.maxDirectionExposureUsdc), exposureTarget), 2);
+  cfg.orderUsdc = qualityScaleActive
+    ? round(orderCap, 2)
+    : round(Math.min(Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.orderUsdc)), orderCap), 2);
+  cfg.probeOrderUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, probeSize), 2);
+  cfg.maxClipUsdc = qualityScaleActive ? round(maxClip, 2) : round(Math.min(num(cfg.maxClipUsdc), maxClip), 2);
+  cfg.targetOrderRows = qualityScaleActive
+    ? targetRows
+    : Math.max(1, Math.min(num(cfg.targetOrderRows, targetRows) || targetRows, targetRows));
+  cfg.maxOrdersPerWindow = cfg.targetOrderRows;
+  cfg.minExpectedEdge = round(Math.max(num(cfg.minExpectedEdge), minEdge), 4);
+  cfg.probeMinExpectedEdge = round(Math.max(num(cfg.probeMinExpectedEdge, 0.008), minEdge * 0.75), 4);
+  cfg.minSignalBps = round(Math.max(num(cfg.minSignalBps), minSignal), 3);
+  cfg.directionMinSignalBps = round(Math.max(num(cfg.minSignalBps), isEth ? minSignal + 0.6 : minSignal + (is15m ? 1 : 0.8)), 3);
+  cfg.directionMinDeltaBps = round(isEth ? (is15m ? 4.8 : 5.6) : (is15m ? 5.4 : 6.2), 3);
+  cfg.directionMinFairGap = round(isEth ? (is15m ? 0.045 : 0.055) : (is15m ? 0.052 : 0.06), 4);
+  cfg.directionMaxVelocityOpposeBps = round(isEth ? 0.9 : 1.1, 3);
+  cfg.directionMaxBookOpposeBps = round(isEth ? 1.1 : 1.4, 3);
+  cfg.maxAsk = round(Math.min(num(cfg.maxAsk), maxAsk), 3);
+  cfg.highConfidenceMaxAsk = round(Math.max(num(cfg.maxAsk), profile.highAsk || maxAsk), 3);
+  cfg.minVisibleDepthUsdc = round(Math.max(num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC), minDepth), 3);
+  cfg.liquidityParticipation = round(Math.min(num(cfg.liquidityParticipation, 0.35), participation), 3);
+  cfg.minFillPrice = round(Math.max(num(cfg.minFillPrice, 0.01), isEth ? 0.1 : 0.08), 3);
+  cfg.flowConfirmMinDominance = round(Math.max(num(cfg.flowConfirmMinDominance, 0.68), isEth ? 0.68 : 0.7), 3);
+  cfg.flowConfirmMinRows = Math.max(4, Math.min(32, Math.ceil((is15m ? 0.35 : 0.5) * Math.max(1, observedRows || profile.targetRows))));
+  cfg.flowConfirmMinUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(is15m ? 180 : 80, Math.max(profile.budget, observedUsdc * 0.22))), 2);
+  cfg.flowConfirmMaxAgeSec = is15m ? 75 : 38;
+  cfg.flowConfirmOpeningWindowSec = is15m ? 270 : 135;
+  cfg.flowConfirmOpeningMaxAgeSec = is15m ? 420 : 210;
+  cfg.flowConfirmOpeningRowRatio = is15m ? 0.5 : 0.65;
+  cfg.flowConfirmMaxOpposingParentBps = isEth ? 4.5 : 5.5;
+  cfg.flowConfirmMinEdge = round(is15m ? -0.004 : 0.002, 4);
+  cfg.qualityScoutEnabled = Boolean(qualityScaleActive && !is15m);
+  cfg.qualityScoutOrderUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, cfg.probeOrderUsdc), 2);
+  cfg.qualityScoutMaxPerCycle = Math.max(2, Math.min(18, Math.floor(targetRows * 0.22)));
+  cfg.qualityScoutRelaxDirectionGate = false;
+  cfg.qualityScoutMinFairGap = round(isEth ? 0.04 : 0.035, 4);
+  cfg.qualityScoutMaxVelocityOpposeBps = round(isEth ? 0.65 : 0.8, 3);
+  cfg.qualityScoutNeedsFlow = false;
+  cfg.qualityScoutMinSignalBps = round(
+    fifteenMinuteScoutEligible
+      ? Math.max(isEth ? 3.4 : 3.0, minSignal - (isEth ? 0.65 : 0.75))
+      : (isEth ? Math.max(3.8, minSignal - 0.2) : Math.max(2.8, minSignal - 0.4)),
+    3,
+  );
+  cfg.qualityScoutMaxParentOpposeBps = round(isEth ? 6 : 7.5, 3);
+  cfg.qualityScoutMakerOnly = true;
+  const learningScoutEligible = false;
+  cfg.liveLearningScoutEnabled = learningScoutEligible;
+  cfg.liveLearningScoutMakerOnly = true;
+  cfg.liveLearningScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.liveLearningScoutMaxPerCycle = is15m
+    ? (isEth ? 2 : 3)
+    : (isEth ? 1 : 4);
+  cfg.liveLearningScoutMinDominance = round(isEth ? (is15m ? 0.54 : 0.68) : (is15m ? 0.56 : 0.62), 3);
+  cfg.liveLearningScoutMinRows = is15m ? (isEth ? 2 : 3) : (isEth ? 5 : 8);
+  cfg.liveLearningScoutMinUsdc = is15m ? (isEth ? 5 : 12) : (isEth ? 18 : 40);
+  cfg.liveLearningScoutMaxAgeSec = is15m ? 120 : 55;
+  cfg.liveLearningScoutMaxLocalOpposeBps = round(isEth ? (is15m ? 3.5 : 2.8) : (is15m ? 5.5 : 4.2), 3);
+  cfg.liveLearningScoutMaxParentOpposeBps = round(isEth ? 4.5 : 5.5, 3);
+  cfg.liveLearningScoutMinEdge = round(isEth ? 0.004 : 0.002, 4);
+  cfg.observedPreferredOutcome = learnedPreferred;
+  cfg.observedMedianBuyUsdc = Number.isFinite(medianBuyUsdc) ? round(medianBuyUsdc, 6) : null;
+  cfg.observedWindowBuyUsdc = round(observedUsdc, 6);
+  cfg.observedWindowBuyRows = observedRows;
+  cfg.observedRecentBuyRows30s = recentFlowRows;
+  cfg.observedBurstPeak1s = burstPeak;
+  cfg.orderTtlSec = Math.max(num(cfg.orderTtlSec, 75), flowLearningHot ? (is15m ? 115 : 70) : 75);
+  cfg.riskTrancheEnabled = true;
+  cfg.initialBudgetFraction = round(mode === "defensive" ? (is15m ? 0.34 : 0.55) : mode === "measured-scale" ? (is15m ? 0.58 : 0.72) : (is15m ? 0.45 : 0.65), 3);
+  cfg.strongBudgetFraction = round(mode === "defensive" ? (is15m ? 0.62 : 0.82) : mode === "measured-scale" ? 0.86 : 0.72, 3);
+  cfg.profitBudgetFraction = round(mode === "defensive" ? 0.92 : 1, 3);
+  cfg.adverseBudgetFraction = round(isEth ? 0.22 : 0.28, 3);
+  const lossStopFraction = is15m
+    ? (mode === "defensive" ? (isEth ? 0.24 : 0.18) : (isEth ? 0.3 : 0.22))
+    : (isEth ? 0.35 : 0.28);
+  cfg.windowLossStopUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, budget * lossStopFraction), 2);
+  cfg.directionLossStopUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, cfg.windowLossStopUsdc * (is15m ? (isEth ? 0.7 : 0.62) : 0.78)), 2);
+  cfg.exitFlipBps = round(is15m ? (isEth ? 3.8 : 3.2) : (isEth ? 4.5 : 4), 3);
+  cfg.exitStopLossPct = round(is15m ? (isEth ? 0.22 : 0.16) : (isEth ? 0.24 : 0.18), 3);
+  cfg.exitBeforeEndSec = Math.max(num(cfg.exitBeforeEndSec), is15m ? 105 : 38);
+  cfg.liveReadyStats = {
+    legKey,
+    recent8Pnl: round(recent8.pnl, 4),
+    recent8WinRate: round(recent8.winRate * 100, 2),
+    recent8AdverseRate: round(recent8.adverseRate * 100, 2),
+    recent24Pnl: round(recent24.pnl, 4),
+    recent24WinRate: round(recent24.winRate * 100, 2),
+    qualityGate,
+    qualityScaleActive,
+    qualityRows: quality12.rows,
+    qualityWinRate: round(quality12.winRate * 100, 2),
+    qualityDirectionRows: qualityDirection12.rows,
+    qualityDirectionHitRate: round(qualityDirection12.hitRate * 100, 2),
+    qualityScoutEnabled: cfg.qualityScoutEnabled,
+    qualityScoutOrderUsdc: cfg.qualityScoutOrderUsdc,
+    qualityScoutMaxPerCycle: cfg.qualityScoutMaxPerCycle,
+    qualityScoutRelaxDirectionGate: cfg.qualityScoutRelaxDirectionGate,
+    qualityScoutMinSignalBps: cfg.qualityScoutMinSignalBps,
+    qualityScoutMinFairGap: cfg.qualityScoutMinFairGap,
+    fifteenMinuteScoutEligible,
+    liveLearningScoutEnabled: cfg.liveLearningScoutEnabled,
+    liveLearningScoutOrderUsdc: cfg.liveLearningScoutOrderUsdc,
+    liveLearningScoutMaxPerCycle: cfg.liveLearningScoutMaxPerCycle,
+    liveLearningScoutMinDominance: cfg.liveLearningScoutMinDominance,
+    liveLearningScoutMinRows: cfg.liveLearningScoutMinRows,
+    liveLearningScoutMinUsdc: cfg.liveLearningScoutMinUsdc,
+    liveLearningScoutMaxAgeSec: cfg.liveLearningScoutMaxAgeSec,
+    recent24AvgWinPnl: round(avgWinPnl, 4),
+    recent24AvgLossAbs: round(avgLossAbs, 4),
+    lossAsymmetryHot,
+    scoutHardBlock,
+    flowLearningHot,
+    observedRows,
+    observedUsdc: round(observedUsdc, 4),
+    recentFlowRows,
+    burstPeak,
+    learnedPreferred,
+    portfolioPnl: round(portfolio.pnl, 4),
+    currentUnrealized: round(currentUnrealized, 4),
+  };
+
+  for (let i = suggestions.length - 1; i >= 0; i -= 1) {
+    if (String(suggestions[i]).includes("using Bonereaper public trades")) suggestions.splice(i, 1);
+  }
+  Object.assign(adjustments, {
+    liveReadyMode: cfg.liveReadyMode,
+    liveReadyStats: cfg.liveReadyStats,
+    directionConfirmEnabled: cfg.directionConfirmEnabled,
+    parentConfirmOnly: cfg.parentConfirmOnly,
+    directionMinSignalBps: cfg.directionMinSignalBps,
+    directionMinDeltaBps: cfg.directionMinDeltaBps,
+    directionMinFairGap: cfg.directionMinFairGap,
+    directionMaxVelocityOpposeBps: cfg.directionMaxVelocityOpposeBps,
+    directionMaxBookOpposeBps: cfg.directionMaxBookOpposeBps,
+    allowLearnedProbe: cfg.allowLearnedProbe,
+    allowComboEntry: false,
+    flowConfirmEnabled: cfg.flowConfirmEnabled,
+    flowConfirmMinDominance: cfg.flowConfirmMinDominance,
+    flowConfirmMinRows: cfg.flowConfirmMinRows,
+    flowConfirmMinUsdc: cfg.flowConfirmMinUsdc,
+    flowConfirmMaxAgeSec: cfg.flowConfirmMaxAgeSec,
+    flowConfirmOpeningWindowSec: cfg.flowConfirmOpeningWindowSec,
+    flowConfirmOpeningMaxAgeSec: cfg.flowConfirmOpeningMaxAgeSec,
+    flowConfirmOpeningRowRatio: cfg.flowConfirmOpeningRowRatio,
+    flowConfirmMaxOpposingParentBps: cfg.flowConfirmMaxOpposingParentBps,
+    flowConfirmMinEdge: cfg.flowConfirmMinEdge,
+    qualityScoutEnabled: cfg.qualityScoutEnabled,
+    qualityScoutOrderUsdc: cfg.qualityScoutOrderUsdc,
+    qualityScoutMaxPerCycle: cfg.qualityScoutMaxPerCycle,
+    qualityScoutRelaxDirectionGate: cfg.qualityScoutRelaxDirectionGate,
+    qualityScoutMinSignalBps: cfg.qualityScoutMinSignalBps,
+    qualityScoutMinFairGap: cfg.qualityScoutMinFairGap,
+    qualityScoutMaxVelocityOpposeBps: cfg.qualityScoutMaxVelocityOpposeBps,
+    qualityScoutNeedsFlow: cfg.qualityScoutNeedsFlow,
+    qualityScoutMaxParentOpposeBps: cfg.qualityScoutMaxParentOpposeBps,
+    qualityScoutMakerOnly: cfg.qualityScoutMakerOnly,
+    liveLearningScoutEnabled: cfg.liveLearningScoutEnabled,
+    liveLearningScoutMakerOnly: cfg.liveLearningScoutMakerOnly,
+    liveLearningScoutOrderUsdc: cfg.liveLearningScoutOrderUsdc,
+    liveLearningScoutMaxPerCycle: cfg.liveLearningScoutMaxPerCycle,
+    liveLearningScoutMinDominance: cfg.liveLearningScoutMinDominance,
+    liveLearningScoutMinRows: cfg.liveLearningScoutMinRows,
+    liveLearningScoutMinUsdc: cfg.liveLearningScoutMinUsdc,
+    liveLearningScoutMaxAgeSec: cfg.liveLearningScoutMaxAgeSec,
+    liveLearningScoutMaxLocalOpposeBps: cfg.liveLearningScoutMaxLocalOpposeBps,
+    liveLearningScoutMaxParentOpposeBps: cfg.liveLearningScoutMaxParentOpposeBps,
+    liveLearningScoutMinEdge: cfg.liveLearningScoutMinEdge,
+    probeEnabled: cfg.probeEnabled,
+    probeMaxPerCycle: cfg.probeMaxPerCycle,
+    inventoryRebalanceRatio: cfg.inventoryRebalanceRatio,
+    hedgeEnabled: false,
+    hedgeMaxAsk: 0,
+    exitEnabled: true,
+    budgetUsdc: cfg.budgetUsdc,
+    maxDirectionExposureUsdc: cfg.maxDirectionExposureUsdc,
+    orderUsdc: cfg.orderUsdc,
+    probeOrderUsdc: cfg.probeOrderUsdc,
+    maxClipUsdc: cfg.maxClipUsdc,
+    targetOrderRows: cfg.targetOrderRows,
+    maxOrdersPerWindow: cfg.maxOrdersPerWindow,
+    minExpectedEdge: cfg.minExpectedEdge,
+    probeMinExpectedEdge: cfg.probeMinExpectedEdge,
+    minSignalBps: cfg.minSignalBps,
+    maxAsk: cfg.maxAsk,
+    highConfidenceMaxAsk: cfg.highConfidenceMaxAsk,
+    minVisibleDepthUsdc: cfg.minVisibleDepthUsdc,
+    liquidityParticipation: cfg.liquidityParticipation,
+    minFillPrice: cfg.minFillPrice,
+    observedPreferredOutcome: cfg.observedPreferredOutcome,
+    observedMedianBuyUsdc: cfg.observedMedianBuyUsdc,
+    observedWindowBuyUsdc: cfg.observedWindowBuyUsdc,
+    observedWindowBuyRows: cfg.observedWindowBuyRows,
+    observedRecentBuyRows30s: cfg.observedRecentBuyRows30s,
+    observedBurstPeak1s: cfg.observedBurstPeak1s,
+    orderTtlSec: cfg.orderTtlSec,
+    riskTrancheEnabled: cfg.riskTrancheEnabled,
+    initialBudgetFraction: cfg.initialBudgetFraction,
+    strongBudgetFraction: cfg.strongBudgetFraction,
+    profitBudgetFraction: cfg.profitBudgetFraction,
+    adverseBudgetFraction: cfg.adverseBudgetFraction,
+    windowLossStopUsdc: cfg.windowLossStopUsdc,
+    directionLossStopUsdc: cfg.directionLossStopUsdc,
+    exitFlipBps: cfg.exitFlipBps,
+    exitStopLossPct: cfg.exitStopLossPct,
+    exitBeforeEndSec: cfg.exitBeforeEndSec,
+  });
+  suggestions.push(`learn-flow ${mode}: ${legKey} budget ${cfg.budgetUsdc}U, rows ${cfg.targetOrderRows}, quality ${round(quality12.winRate * 100, 1)}%/${round(qualityDirection12.hitRate * 100, 1)}%, Bonereaper flow ${flowLearningHot ? "active" : "watch"}, hold-to-settle with ${cfg.exitFlipBps}bps flip stop`);
 }
 
 function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000)) {
@@ -2173,6 +3160,7 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
       String(row.strategyVersionId || "") === String(clone.strategyVersionId || STRATEGY_VERSION_ID)
       && (!clone.ledgerResetId || String(row.ledgerResetId || "") === String(clone.ledgerResetId))
       && ((row.asset || slugAsset(row.slug) || "BTC") === (clone.asset || "BTC"))
+      && (!clone.legKey || String(row.legKey || slugLegKey(row.slug)) === String(clone.legKey))
     ));
     const recent = history.slice(0, 8);
     const recentAvgPnl = recent.length ? recent.reduce((total, row) => total + num(row.pnl), 0) / recent.length : 0;
@@ -2356,8 +3344,9 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
   cfg.maxClipUsdc = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC));
   if ((clone.horizon || slugHorizon(clone.market?.slug)) === "5m") {
     const isEth = (clone.asset || slugAsset(clone.market?.slug)) === "ETH";
+    const isSmallBankroll = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
     const fiveMinuteBudgetCap = isEth ? 12 : 30;
-    cfg.parentConfirmOnly = true;
+    cfg.parentConfirmOnly = !isSmallBankroll;
     cfg.allowLearnedProbe = false;
     cfg.allowComboEntry = false;
     cfg.flowConfirmEnabled = true;
@@ -2377,7 +3366,7 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
     cfg.budgetUsdc = round(Math.min(num(cfg.budgetUsdc), fiveMinuteBudgetCap), 2);
     cfg.maxDirectionExposureUsdc = round(Math.min(num(cfg.maxDirectionExposureUsdc), Math.max(8, cfg.budgetUsdc * 0.65)), 2);
     cfg.orderUsdc = round(clamp(num(cfg.orderUsdc), POLYMARKET_MIN_ORDER_USDC, isEth ? 1.55 : 2.2), 2);
-    cfg.maxClipUsdc = round(Math.min(num(cfg.maxClipUsdc), isEth ? 2.4 : 3.8), 2);
+    cfg.maxClipUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(num(cfg.maxClipUsdc), isEth ? 7.5 : 9)), 2);
     cfg.minSignalBps = round(Math.max(num(cfg.minSignalBps), isEth ? 4.4 : 3.2), 3);
     cfg.minExpectedEdge = round(Math.max(num(cfg.minExpectedEdge), isEth ? 0.038 : 0.024), 4);
     cfg.maxAsk = round(Math.min(num(cfg.maxAsk), isEth ? 0.88 : 0.94), 3);
@@ -2387,7 +3376,7 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
     cfg.executionLatencyMs = Math.max(600, num(cfg.executionLatencyMs, 600));
     cfg.makerPenetrationTicks = Math.max(1, num(cfg.makerPenetrationTicks, 1));
     Object.assign(adjustments, {
-      parentConfirmOnly: true,
+      parentConfirmOnly: cfg.parentConfirmOnly,
       allowLearnedProbe: false,
       allowComboEntry: false,
       flowConfirmEnabled: true,
@@ -2413,8 +3402,12 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
       makerPenetrationTicks: cfg.makerPenetrationTicks,
     });
     suggestions.push(isEth
-      ? "ETH 5m tightened: stronger flow, parent, edge, depth and lower participation"
-      : "5m flow-carry mode: parent-confirmed entries, fresh Bonereaper flow, or opening flow carry with reduced size");
+      ? (isSmallBankroll
+        ? "ETH 5m 50U soft-parent mode: direction, edge, depth and 1U loss stop without hard parent blocking"
+        : "ETH 5m tightened: stronger flow, parent, edge, depth and lower participation")
+      : (isSmallBankroll
+        ? "BTC 5m 50U soft-parent mode: direction, edge, depth and 1U loss stop without hard parent blocking"
+        : "5m flow-carry mode: parent-confirmed entries, fresh Bonereaper flow, or opening flow carry with reduced size"));
   } else if ((clone.asset || slugAsset(clone.market?.slug)) === "ETH") {
     cfg.flowConfirmEnabled = true;
     cfg.flowConfirmMinDominance = Math.max(num(cfg.flowConfirmMinDominance, 0.68), 0.68);
@@ -2444,6 +3437,9 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
     });
     suggestions.push("ETH 15m signal-quality filter: flow confirmation, edge, depth and lower participation");
   }
+  applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions);
+  applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions);
+  applyCloneLegCapConfig(clone, cfg, adjustments, suggestions);
   clone.config = cfg;
   clone.adaptive = {
     enabled,
@@ -2684,12 +3680,16 @@ function cloneCandidateChildOrders(candidate, clone, elapsed) {
   const observedRows = Math.max(num(cfg.observedWindowBuyRows), num(clone.learner?.currentObservedBuys));
   const recentRows = Math.max(num(cfg.observedRecentBuyRows30s), num(clone.learner?.recentBuyRows30s));
   const burstRows = Math.max(num(cfg.observedBurstPeak1s), num(clone.learner?.burstPeak1s));
-  const baseChildren = candidate.kind === "learned-probe"
+  const baseChildren = candidate.kind === "live-learning-scout"
+    ? Math.ceil(Math.max(1, observedRows / 20, recentRows * 1.2, burstRows * 1.5))
+    : candidate.kind === "learned-probe"
     ? Math.ceil(Math.max(2, observedRows / 9, recentRows * 1.6, burstRows * 3))
     : candidate.kind === "flow-confirm"
       ? Math.ceil(Math.max(2, observedRows / 10, recentRows * 2, burstRows * 4))
     : candidate.kind === "flow-carry"
       ? Math.ceil(Math.max(1, observedRows / 14, burstRows * 2))
+    : candidate.kind === "quality-scout"
+      ? Math.ceil(Math.max(1, observedRows / 18, recentRows * 1.2, burstRows * 2))
     : candidate.kind === "directional"
       ? Math.ceil(Math.max(1, observedRows / 16, recentRows))
       : candidate.kind === "probe"
@@ -2701,7 +3701,12 @@ function cloneCandidateChildOrders(candidate, clone, elapsed) {
   const styleCap = candidate.style === "cross" ? (highFlow ? 14 : 6) : (highFlow ? 22 : 10);
   const earlyBoost = Number.isFinite(elapsed) && elapsed <= 120 ? 1.45 : 1;
   const catchUpBoost = Number.isFinite(elapsed) && elapsed >= 210 ? 1.25 : 1;
-  const childCount = Math.min(remainingRows, styleCap, Math.max(1, Math.ceil(baseChildren * earlyBoost * catchUpBoost)));
+  const scoutCap = candidate.kind === "live-learning-scout"
+    ? Math.max(1, Math.floor(num(cfg.liveLearningScoutMaxPerCycle, 2)))
+    : candidate.kind === "quality-scout"
+      ? Math.max(1, Math.floor(num(cfg.qualityScoutMaxPerCycle, 2)))
+      : Infinity;
+  const childCount = Math.min(remainingRows, styleCap, scoutCap, Math.max(1, Math.ceil(baseChildren * earlyBoost * catchUpBoost)));
   return Array.from({ length: childCount }, (_, index) => ({
     ...candidate,
     childCount,
@@ -2734,6 +3739,11 @@ function generateCloneExits(clone, nowSec) {
   const live = market?.active && !market?.closed && Number.isFinite(elapsed) && elapsed >= 0 && remaining > 0;
   if (!live) return 0;
   const cfg = clone.config || {};
+  const signal = cloneSignalModel(clone, nowSec);
+  const exitFlipBps = Math.max(0.1, num(cfg.exitFlipBps, 1.5));
+  const stopLossPct = Math.max(0.02, num(cfg.exitStopLossPct, 0.18));
+  const exitMinBid = Math.max(0.04, num(cfg.minFillPrice, 0.01) * 0.5);
+  const is15m = slugWindowSeconds(market?.slug) > 300;
   let sold = 0;
   for (const outcome of OUTCOMES) {
     const position = clone.positions?.[outcome];
@@ -2743,19 +3753,47 @@ function generateCloneExits(clone, nowSec) {
     if (shares <= 0.000001 || cost <= 0 || !Number.isFinite(quote?.bid) || quote.bid <= 0) continue;
     const avgPrice = num(position.avgPrice, cost / shares);
     const pnlPct = avgPrice > 0 ? (quote.bid - avgPrice) / avgPrice : 0;
+    const exitFee = shares * feePerShare(quote.bid, num(cfg.takerFeeRate, 0.07));
+    const positionPnl = round(Math.max(0, shares * quote.bid - exitFee) - cost, 6);
+    const signalAgainst = Boolean(
+      signal.preferred
+      && signal.preferred !== outcome
+      && Math.abs(num(signal.signalBps)) >= exitFlipBps
+    );
+    const strongAgainst = signalAgainst && Math.abs(num(signal.signalBps)) >= exitFlipBps * 1.6;
+    const adverseDirection = clone.adverseSelection?.byDirection?.[outcome] || {};
+    const adverseHot = num(adverseDirection.checked) >= 4
+      && num(adverseDirection.rate) >= 0.55
+      && num(adverseDirection.avgBps) <= -120;
+    const hardStop = pnlPct <= -stopLossPct
+      && (signalAgainst || adverseHot || positionPnl < -Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.directionLossStopUsdc, 2)));
+    const flipStop = signalAgainst && pnlPct <= -Math.min(0.08, stopLossPct * 0.55);
+    const lateRiskOff = remaining <= num(cfg.exitBeforeEndSec)
+      && signalAgainst
+      && pnlPct < -Math.min(0.06, stopLossPct * 0.45);
     const nearCertainProfit = quote.bid >= Math.max(0.97, avgPrice * (1 + Math.max(0.2, num(cfg.exitTakeProfitPct))));
     const lateProfitProtect = remaining <= num(cfg.exitBeforeEndSec) && quote.bid >= Math.max(0.95, avgPrice * 1.35);
-    if (!nearCertainProfit && !lateProfitProtect) continue;
+    if (!nearCertainProfit && !lateProfitProtect && !hardStop && !flipStop && !lateRiskOff) continue;
+    if ((hardStop || flipStop || lateRiskOff) && quote.bid < exitMinBid) continue;
+    const sellFraction = hardStop
+      ? (strongAgainst || is15m ? 0.72 : 0.55)
+      : flipStop || lateRiskOff
+        ? (is15m ? 0.5 : 0.35)
+        : 0.25;
     if (recordCloneSell(clone, {
       nowSec,
       outcome,
-      shares: shares * 0.25,
+      shares: shares * sellFraction,
       limitPrice: quote.bid,
       quoteBid: quote.bid,
       quoteAsk: quote.ask,
       reason: nearCertainProfit
         ? `rare settlement-hold profit lock at bid ${quote.bid}`
-        : `late settlement-hold profit protect with ${remaining}s left`,
+        : lateProfitProtect
+          ? `late settlement-hold profit protect with ${remaining}s left`
+          : hardStop
+            ? `loss-asymmetry stop ${outcome}: pnl ${round(positionPnl, 3)}U, flip ${round(num(signal.signalBps), 2)}bps, adverse ${round(num(adverseDirection.rate) * 100, 1)}%`
+            : `flip risk-off ${outcome}: pnlPct ${round(pnlPct * 100, 1)}%, signal ${round(num(signal.signalBps), 2)}bps`,
     })) sold += 1;
   }
   return sold;
@@ -2798,7 +3836,8 @@ function generateCloneOrders(clone, nowSec) {
     };
     return;
   }
-  if (remainingBudget <= 1) {
+  const minBudgetForOrder = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minFillUsdc, POLYMARKET_MIN_ORDER_USDC));
+  if (remainingBudget + 0.000001 < minBudgetForOrder) {
     clone.lastDecision = { ts: nowSec, isoTime: isoFromSec(nowSec), status: "budget-full", spent, pending, reason: "paper budget reached" };
     return;
   }
@@ -2810,13 +3849,75 @@ function generateCloneOrders(clone, nowSec) {
   let preferred = signal.preferred;
   const signalAbs = Math.abs(signalBps);
   const flow = bonereaperFlowSignal(clone, cfg);
+  let qualityScoutActive = false;
+  let qualityScoutReason = "";
+  let liveLearningScoutActive = false;
+  let liveLearningScoutReason = "";
+  const learnedScoutOutcome = clone.learner?.preferredOutcome || cfg.observedPreferredOutcome || "";
+  const learnedScoutRows = learnedScoutOutcome ? num(clone.learner?.byOutcome?.[learnedScoutOutcome]?.rows, num(clone.learner?.preferredRows)) : 0;
+  const learnedScoutUsdc = learnedScoutOutcome ? num(clone.learner?.byOutcome?.[learnedScoutOutcome]?.usdc, num(clone.learner?.preferredUsdc)) : 0;
+  const learnedScoutTotalUsdc = num(clone.learner?.totalBuyUsdc, num(clone.learner?.currentBuyUsdc));
+  const learnedScoutDominance = learnedScoutTotalUsdc > 0 ? learnedScoutUsdc / learnedScoutTotalUsdc : 0;
+  const learnedScoutAge = num(clone.learner?.lastBuyAgeSec, 999);
+  const learnedScoutRecentRows = num(clone.learner?.recentBuyRows30s, num(cfg.observedRecentBuyRows30s));
+  const learnedScoutDir = learnedScoutOutcome === "Up" ? 1 : learnedScoutOutcome === "Down" ? -1 : 0;
+  const learnedScoutLocalOppose = learnedScoutDir ? learnedScoutDir * signalBps < -num(cfg.liveLearningScoutMaxLocalOpposeBps, 4) : true;
+  const learnedScoutParentPreferred = cfg.parentPreferredOutcome || clone.parentTrend?.preferred || "";
+  const learnedScoutParentDelta = Math.abs(num(cfg.parentTrendBps, clone.parentTrend?.deltaBps));
+  const learnedScoutParentOppose = Boolean(
+    learnedScoutParentPreferred
+    && learnedScoutOutcome
+    && learnedScoutParentPreferred !== learnedScoutOutcome
+    && learnedScoutParentDelta > num(cfg.liveLearningScoutMaxParentOpposeBps, 5.5)
+  );
+  const liveLearningScoutAllowed = Boolean(cfg.liveLearningScoutEnabled)
+    && Boolean(learnedScoutOutcome)
+    && learnedScoutRows >= num(cfg.liveLearningScoutMinRows, 4)
+    && learnedScoutUsdc >= num(cfg.liveLearningScoutMinUsdc, POLYMARKET_MIN_ORDER_USDC)
+    && learnedScoutDominance >= num(cfg.liveLearningScoutMinDominance, 0.6)
+    && (
+      learnedScoutAge <= num(cfg.liveLearningScoutMaxAgeSec, 60)
+      || learnedScoutRecentRows > 0
+      || flow.active
+    )
+    && !learnedScoutLocalOppose
+    && !learnedScoutParentOppose;
   if (cfg.parentConfirmOnly) {
     const parentPreferred = cfg.parentPreferredOutcome || clone.parentTrend?.preferred || "";
     const parentStrong = Boolean(cfg.parentTrendStrong || clone.parentTrend?.strong);
     const parentConfirmed = Boolean(preferred && parentPreferred && preferred === parentPreferred && parentStrong);
     const flowConfirmed = Boolean(flow.active);
     if (flowConfirmed && !parentConfirmed) preferred = flow.preferred;
-    if (!parentConfirmed && !flowConfirmed) {
+    const scoutThreshold = num(cfg.qualityScoutMinSignalBps, Math.max(2.8, num(cfg.minSignalBps, 3.2) - 0.4));
+    const scoutPreferred = preferred || (signalBps >= scoutThreshold ? "Up" : signalBps <= -scoutThreshold ? "Down" : "");
+    const parentDeltaAbs = Math.abs(num(cfg.parentTrendBps, clone.parentTrend?.deltaBps));
+    const scoutBlockedByParent = Boolean(
+      parentPreferred
+      && scoutPreferred
+      && parentPreferred !== scoutPreferred
+      && parentDeltaAbs > num(cfg.qualityScoutMaxParentOpposeBps, 7.5)
+    );
+    const qualityScoutAllowed = Boolean(cfg.qualityScoutEnabled)
+      && Boolean(scoutPreferred)
+      && signalAbs >= scoutThreshold
+      && remaining > Math.max(25, num(cfg.exitBeforeEndSec, 38))
+      && !scoutBlockedByParent;
+    if (!parentConfirmed && !flowConfirmed && qualityScoutAllowed) {
+      preferred = scoutPreferred;
+      qualityScoutActive = true;
+      qualityScoutReason = `quality scout ${preferred}: signal ${round(signalBps, 2)} bps, parent ${parentPreferred || "-"} ${round(parentDeltaAbs, 2)} bps, ${flow.reason}`;
+    }
+    if (!parentConfirmed && flowConfirmed && liveLearningScoutAllowed && flow.preferred === learnedScoutOutcome) {
+      preferred = learnedScoutOutcome;
+      liveLearningScoutActive = true;
+      liveLearningScoutReason = `live learning scout ${preferred}: ${flow.reason}; local signal weak but not hard opposite`;
+    }
+    if (!parentConfirmed && !flowConfirmed && !qualityScoutActive && liveLearningScoutAllowed) {
+      preferred = learnedScoutOutcome;
+      liveLearningScoutActive = true;
+      liveLearningScoutReason = `live learning scout ${preferred}: Bonereaper dominance ${round(learnedScoutDominance * 100, 1)}% rows ${learnedScoutRows} usdc ${round(learnedScoutUsdc, 2)} age ${round(learnedScoutAge, 1)}s`;
+    }
+    if (!parentConfirmed && !flowConfirmed && !qualityScoutActive && !liveLearningScoutActive) {
       clone.lastDecision = {
         ts: nowSec,
         isoTime: isoFromSec(nowSec),
@@ -2831,6 +3932,32 @@ function generateCloneOrders(clone, nowSec) {
       return;
     }
   }
+  if (!cfg.parentConfirmOnly && cfg.qualityScoutEnabled) {
+    const scoutThreshold = num(cfg.qualityScoutMinSignalBps, Math.max(3, num(cfg.minSignalBps, 3.2) - 0.7));
+    const scoutPreferred = preferred || (signalBps >= scoutThreshold ? "Up" : signalBps <= -scoutThreshold ? "Down" : "");
+    const flowRows = Math.max(num(clone.learner?.currentObservedBuys), num(cfg.observedWindowBuyRows));
+    const flowUsdc = Math.max(num(clone.learner?.currentBuyUsdc), num(cfg.observedWindowBuyUsdc));
+    const recentRows = Math.max(num(clone.learner?.recentBuyRows30s), num(cfg.observedRecentBuyRows30s));
+    const flowEnough = !cfg.qualityScoutNeedsFlow
+      || flow.active
+      || recentRows >= 1
+      || flowRows >= Math.max(4, Math.ceil(num(cfg.flowConfirmMinRows, 8) * 0.35))
+      || flowUsdc >= Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.flowConfirmMinUsdc, 40) * 0.2);
+    const scoutAllowed = Boolean(scoutPreferred)
+      && signalAbs >= scoutThreshold
+      && remaining > Math.max(45, num(cfg.exitBeforeEndSec, 75) * 0.65)
+      && flowEnough;
+    if (scoutAllowed) {
+      preferred = scoutPreferred;
+      qualityScoutActive = true;
+      qualityScoutReason = `15m maker scout ${preferred}: signal ${round(signalBps, 2)} bps, flow rows ${flowRows}, recent ${recentRows}, usdc ${round(flowUsdc, 2)}`;
+    }
+  }
+  if (!cfg.parentConfirmOnly && !qualityScoutActive && liveLearningScoutAllowed) {
+    preferred = learnedScoutOutcome;
+    liveLearningScoutActive = true;
+    liveLearningScoutReason = `live learning scout ${preferred}: Bonereaper dominance ${round(learnedScoutDominance * 100, 1)}% rows ${learnedScoutRows} usdc ${round(learnedScoutUsdc, 2)} age ${round(learnedScoutAge, 1)}s`;
+  }
   const probeAllowed = Boolean(cfg.probeEnabled)
     && signalAbs >= num(cfg.probeMinSignalBps, 0.1)
     && remaining > 25;
@@ -2844,6 +3971,43 @@ function generateCloneOrders(clone, nowSec) {
       preferred: "",
       signal,
       reason: `BTC signal ${round(signalBps, 2)} bps below ${cfg.minSignalBps} bps threshold`,
+    };
+    return;
+  }
+  const directionGate = cloneDirectionConfirmation(clone, signal, preferred);
+  if (preferred && !directionGate.ok) {
+    const dir = preferred === "Up" ? 1 : -1;
+    const scoutFairGap = preferred === "Up" ? fairUp - 0.5 : 0.5 - fairUp;
+    const scoutDirectionOk = Boolean(qualityScoutActive && cfg.qualityScoutRelaxDirectionGate)
+      && dir * signalBps >= num(cfg.qualityScoutMinSignalBps, 3)
+      && scoutFairGap >= num(cfg.qualityScoutMinFairGap, 0.025)
+      && dir * num(signal.velocityBps, 0) >= -num(cfg.qualityScoutMaxVelocityOpposeBps, 1);
+    const liveLearningDirectionOk = Boolean(liveLearningScoutActive)
+      && dir * signalBps >= -num(cfg.liveLearningScoutMaxLocalOpposeBps, 4)
+      && scoutFairGap >= -0.018
+      && dir * num(signal.velocityBps, 0) >= -num(cfg.liveLearningScoutMaxLocalOpposeBps, 4);
+    if (scoutDirectionOk) {
+      directionGate.ok = true;
+      directionGate.scoutRelaxed = true;
+      directionGate.reason = `${directionGate.reason}; relaxed for 5U maker scout`;
+    } else if (liveLearningDirectionOk) {
+      directionGate.ok = true;
+      directionGate.liveLearningRelaxed = true;
+      directionGate.reason = `${directionGate.reason}; relaxed for live-learning 5U maker scout`;
+    }
+  }
+  if (preferred && !directionGate.ok) {
+    clone.lastDecision = {
+      ts: nowSec,
+      isoTime: isoFromSec(nowSec),
+      status: "idle",
+      elapsedSec: elapsed,
+      remainingSec: remaining,
+      fairUp: round(fairUp, 4),
+      preferred,
+      signal,
+      directionGate,
+      reason: directionGate.reason,
     };
     return;
   }
@@ -2892,20 +4056,33 @@ function generateCloneOrders(clone, nowSec) {
     const quote = clone.orderbook?.[outcome];
     if (!Number.isFinite(quote?.ask)) continue;
     const parentOrFlowOutcome = flow.active ? flow.preferred : cfg.parentPreferredOutcome;
-    if (cfg.parentConfirmOnly && outcome !== parentOrFlowOutcome) continue;
-    if (cfg.parentBlockedOutcome === outcome && signalAbs < num(cfg.whaleConfidenceBps) * 1.15) continue;
+    if (cfg.parentConfirmOnly && !qualityScoutActive && !liveLearningScoutActive && outcome !== parentOrFlowOutcome) continue;
+    if (cfg.parentConfirmOnly && qualityScoutActive && outcome !== preferred) continue;
+    if (cfg.parentConfirmOnly && liveLearningScoutActive && outcome !== preferred) continue;
+    if (!qualityScoutActive && cfg.parentBlockedOutcome === outcome && signalAbs < num(cfg.whaleConfidenceBps) * 1.15) continue;
     const strongMomentum = Math.abs(signalBps) >= num(cfg.minSignalBps) * 2;
     const isPreferred = outcome === preferred;
+    const qualityScout = qualityScoutActive && outcome === preferred;
+    const liveLearningScout = liveLearningScoutActive && outcome === preferred;
     const isLearnedProbe = learnedActive && outcome === learnedPreferred && (!preferred || !strongMomentum);
     const isProbe = !preferred || isLearnedProbe || (Boolean(cfg.probeEnabled) && signalAbs < num(cfg.minSignalBps));
     if (!isPreferred && !cfg.hedgeEnabled && !isProbe && !isLearnedProbe) continue;
     const cheapHedge = Boolean(cfg.hedgeEnabled) && !isPreferred && quote.ask <= cfg.hedgeMaxAsk;
+    const smallBankroll = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
     const highConfidence = signalAbs >= num(cfg.highConfidenceBps);
+    const highConfidencePriceAllowed = isPreferred
+      && highConfidence
+      && quote.ask <= Math.min(0.98, num(cfg.highConfidenceMaxAsk, cfg.maxAsk));
     const crossFeeRate = feeRateForOrder(clone, outcome, "cross");
     const crossEffectiveAsk = effectiveBuyPrice(takerLimitPrice(quote.ask, cfg), crossFeeRate);
     const crossEdge = round(fair[outcome] - crossEffectiveAsk, 6);
     const makerEdgeAtBetterPrice = round(fair[outcome] - effectiveBuyPrice(Math.max(0.01, quote.ask - 0.03), feeRateForOrder(clone, outcome, "maker-ladder")), 6);
     const hasExpectedEdge = crossEdge >= num(cfg.minExpectedEdge);
+    const smallBankrollMakerRetraceAllowed = smallBankroll
+      && isPreferred
+      && signalAbs >= num(cfg.minSignalBps)
+      && quote.ask <= Math.min(0.99, num(cfg.highConfidenceMaxAsk, cfg.maxAsk) + 0.06)
+      && makerEdgeAtBetterPrice >= num(cfg.probeMinExpectedEdge, cfg.minExpectedEdge);
     const flowDriven = cfg.parentConfirmOnly && flow.active && outcome === flow.preferred;
     const flowLadderAllowed = flowDriven
       && quote.ask <= 0.99
@@ -2913,20 +4090,39 @@ function generateCloneOrders(clone, nowSec) {
       && num(flow.preferredRows) >= Math.max(4, Math.ceil(num(cfg.flowConfirmMinRows, 12) * 0.65));
     const directionalAllowed = hasExpectedEdge
       || (isPreferred && highConfidence && makerEdgeAtBetterPrice >= num(cfg.minExpectedEdge))
+      || (qualityScout && (
+        makerEdgeAtBetterPrice >= num(cfg.probeMinExpectedEdge, num(cfg.minExpectedEdge) * 0.75)
+        || (highConfidence && levelEdgeSafe(fair[outcome], quote.ask, cfg))
+      ))
+      || (liveLearningScout && makerEdgeAtBetterPrice >= num(cfg.liveLearningScoutMinEdge, 0.002))
+      || smallBankrollMakerRetraceAllowed
       || (flowDriven && (crossEdge >= 0.006 || makerEdgeAtBetterPrice >= num(cfg.flowConfirmMinEdge, -0.006)))
       || flowLadderAllowed;
-    const probeAllowedForOutcome = (isProbe || isLearnedProbe) && quote.ask <= cfg.maxAsk;
-    if ((quote.ask <= cfg.maxAsk || flowLadderAllowed) && (directionalAllowed || cheapHedge || probeAllowedForOutcome)) {
-      const levels = cloneCandidateLevels(quote, cfg, isPreferred, strongMomentum, cheapHedge)
+    const probeAllowedForOutcome = (isProbe || isLearnedProbe || qualityScout || liveLearningScout) && quote.ask <= cfg.maxAsk;
+    if ((quote.ask <= cfg.maxAsk || highConfidencePriceAllowed || smallBankrollMakerRetraceAllowed || flowLadderAllowed) && (directionalAllowed || cheapHedge || probeAllowedForOutcome)) {
+      let levels = cloneCandidateLevels(quote, cfg, isPreferred, strongMomentum, cheapHedge)
         .concat(flowLadderAllowed ? cloneFlowRetraceLevels(quote, cfg, clone, outcome, fair[outcome]) : []);
+      if (smallBankroll && cfg.smallBankrollMakerOnly && !highConfidence) {
+        levels = levels.filter((level) => level.style === "maker-ladder");
+      }
+      if (qualityScout && cfg.qualityScoutMakerOnly !== false) {
+        levels = levels.filter((level) => level.style === "maker-ladder");
+      }
+      if (liveLearningScout && cfg.liveLearningScoutMakerOnly !== false) {
+        levels = levels.filter((level) => level.style === "maker-ladder");
+      }
       const learnedBurst = isLearnedProbe && (num(clone.learner?.recentBuyRows30s) >= 3 || num(clone.learner?.burstPeak1s) >= 3);
       const observedPressure = num(clone.learner?.currentObservedBuys) >= 20 || num(clone.learner?.recentBuyRows30s) >= 2 || num(clone.learner?.byOutcome?.[outcome]?.rows) >= 12;
       const allowMicroCross = observedPressure && quote.ask <= Math.min(num(cfg.maxAsk), 0.96) && (levelEdgeSafe(fair[outcome], quote.ask, cfg) || isLearnedProbe);
       const filteredLevels = isProbe && !learnedBurst && !allowMicroCross ? levels.filter((level) => level.style === "maker-ladder") : levels;
       const flowKind = flowDriven && flow.mode === "opening-carry" ? "flow-carry" : "flow-confirm";
-      const kind = cheapHedge && !isPreferred ? "hedge" : isLearnedProbe ? "learned-probe" : isProbe ? "probe" : "directional";
+      const kind = liveLearningScout ? "live-learning-scout" : qualityScout ? "quality-scout" : cheapHedge && !isPreferred ? "hedge" : isLearnedProbe ? "learned-probe" : isProbe ? "probe" : "directional";
       const reason = cheapHedge
         ? `Bonereaper-style hedge ${outcome} ask ${quote.ask} combo ${comboAsk}`
+        : liveLearningScout
+          ? `${liveLearningScoutReason}; maker-first live-paper participation`
+        : qualityScout
+          ? `${qualityScoutReason}; maker-first participation`
         : isLearnedProbe
           ? `learned Bonereaper pressure on ${outcome}, still requiring paper edge`
         : isProbe
@@ -2944,13 +4140,23 @@ function generateCloneOrders(clone, nowSec) {
           && !(kind === "probe" && levelEdge >= num(cfg.probeMinExpectedEdge))
           && !(kind === "learned-probe" && levelEdge >= num(cfg.probeMinExpectedEdge))
           && !(kind === "learned-probe" && num(clone.learner?.byOutcome?.[outcome]?.usdc) > 0 && levelEdge >= -0.015)
+          && !(kind === "live-learning-scout" && level.style === "maker-ladder" && levelEdge >= num(cfg.liveLearningScoutMinEdge, 0.002))
+          && !(kind === "quality-scout" && level.style === "maker-ladder" && levelEdge >= num(cfg.probeMinExpectedEdge, num(cfg.minExpectedEdge) * 0.75))
+          && !(kind === "quality-scout" && highConfidence && levelEdge >= -0.01)
           && !(flowDriven && levelEdge >= num(cfg.flowConfirmMinEdge, -0.006))
           && !(flowLadderAllowed && level.style === "maker-ladder" && levelEdge >= (flow.mode === "opening-carry" ? -0.18 : -0.12))
           && !(isPreferred && highConfidence && levelEdge >= -0.005)
         ) continue;
-        if (level.limitPrice > cfg.maxAsk) continue;
+        const levelMaxAsk = (highConfidencePriceAllowed || smallBankrollMakerRetraceAllowed) && isPreferred
+          ? Math.min(0.98, num(cfg.highConfidenceMaxAsk, cfg.maxAsk))
+          : cfg.maxAsk;
+        if (level.limitPrice > levelMaxAsk) continue;
         const priority = flowDriven
           ? 3.4 + Math.max(0, flow.dominance - 0.75) * 8 + Math.max(0, levelEdge)
+          : liveLearningScout
+          ? 2.25 + Math.max(0, learnedScoutDominance - num(cfg.liveLearningScoutMinDominance, 0.6)) * 3 + Math.max(0, levelEdge)
+          : qualityScout
+          ? 2.15 + Math.max(0, signalAbs - num(cfg.qualityScoutMinSignalBps, 2.8)) * 0.08 + Math.max(0, levelEdge)
           : kind === "probe" || kind === "learned-probe"
           ? 1.4 + Math.max(0, levelEdge)
           : (isPreferred ? (strongMomentum ? 4 : 3) : 2) + (level.style === "cross" ? 0.2 : 0);
@@ -2964,8 +4170,8 @@ function generateCloneOrders(clone, nowSec) {
           effectivePrice: levelEffectivePrice,
           signalBps,
           confidence: signal.confidence,
-          kind: flowDriven ? flowKind : kind,
-          reason: flowDriven ? flow.reason : reason,
+          kind: flowDriven && !liveLearningScout ? flowKind : kind,
+          reason: flowDriven && !liveLearningScout ? flow.reason : reason,
         });
       }
     }
@@ -3030,9 +4236,25 @@ function generateCloneOrders(clone, nowSec) {
     .sort((a, b) => b.priority - a.priority || b.edge - a.edge)
     .slice(0, candidateLimit);
   const probeCount = selected.filter((row) => row.kind === "probe" || row.kind === "learned-probe").length;
-  const selectedCapped = probeCount > maxProbePerCycle
+  const scoutCount = selected.filter((row) => row.kind === "quality-scout").length;
+  const maxScoutPerCycle = Math.max(1, Math.floor(num(cfg.qualityScoutMaxPerCycle, 2)));
+  const learningScoutCount = selected.filter((row) => row.kind === "live-learning-scout").length;
+  const maxLearningScoutPerCycle = Math.max(1, Math.floor(num(cfg.liveLearningScoutMaxPerCycle, 2)));
+  let selectedCapped = probeCount > maxProbePerCycle
     ? selected.filter((row) => row.kind !== "probe" && row.kind !== "learned-probe").concat(selected.filter((row) => row.kind === "probe" || row.kind === "learned-probe").slice(0, maxProbePerCycle))
     : selected;
+  if (scoutCount > maxScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "quality-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "quality-scout").slice(0, maxScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (learningScoutCount > maxLearningScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "live-learning-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "live-learning-scout").slice(0, maxLearningScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
   if (!selectedCapped.length) {
     clone.lastDecision = {
       ts: nowSec,
@@ -3056,10 +4278,13 @@ function generateCloneOrders(clone, nowSec) {
     if (placed >= placeLimit) break;
     const quote = clone.orderbook?.[candidate.outcome];
     if (!Number.isFinite(quote?.ask)) continue;
+    const smallBankroll = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
+    if (smallBankroll && cfg.smallBankrollMakerOnly && candidate.style === "cross" && Math.abs(num(candidate.signalBps)) < num(cfg.highConfidenceBps)) continue;
     const limitPrice = Number.isFinite(candidate.limitPrice) ? candidate.limitPrice : candidate.style === "cross"
       ? takerLimitPrice(quote.ask, cfg)
       : round(clamp(Math.min(quote.ask - 0.01, num(quote.bid, quote.ask - 0.02) + 0.01), 0.01, cfg.maxAsk), 2);
     if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice > cfg.maxAsk) continue;
+    if (limitPrice < num(cfg.minFillPrice, 0.01)) continue;
     if (hasRecentCloneOrder(clone, candidate.outcome, limitPrice, nowSec, cfg.cooldownSec)) continue;
     const depthUsdc = visibleAskDepthUsdc(quote, limitPrice);
     if (candidate.style === "cross" && depthUsdc < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC))) continue;
@@ -3069,11 +4294,15 @@ function generateCloneOrders(clone, nowSec) {
     const directionTotal = num(clone.positions?.[candidate.outcome]?.cost) + pendingByDirection(clone, candidate.outcome);
     if (directionTotal >= cfg.maxDirectionExposureUsdc) continue;
     if (losingDirectionCap(clone, candidate.outcome, directionTotal) && candidate.kind !== "inventory-balance") continue;
+    const riskBudgetCap = liveRiskBudgetCapForCandidate(clone, candidate);
+    const riskBudgetRemaining = riskBudgetCap - cloneSpent(clone) - clonePending(clone);
+    if (riskBudgetRemaining <= 0) continue;
 
     const minNotional = minCloneOrderNotional(clone, candidate.outcome, candidate.effectivePrice || effectiveBuyPrice(limitPrice, candidate.feeRate));
     const notional = dynamicCloneNotional(clone, candidate, limitPrice, elapsed, minNotional);
     const cappedNotional = Math.min(
       notional,
+      riskBudgetRemaining,
       cfg.budgetUsdc - cloneSpent(clone) - clonePending(clone),
       cfg.maxDirectionExposureUsdc - directionTotal,
     );
@@ -3200,7 +4429,9 @@ function simulateCloneFill(clone, order, nowSec, reason) {
   if (remaining <= 0) return null;
   const baseParticipation = num(cfg.liquidityParticipation, 0.35);
   const participation = makerLike ? Math.min(baseParticipation * 0.35, 0.18) : Math.min(baseParticipation, 0.65);
-  const levels = visibleAskLevelsAtOrBelow(quote, fillLimit);
+  const minFillPrice = num(cfg.minFillPrice, 0.01);
+  const levels = visibleAskLevelsAtOrBelow(quote, fillLimit)
+    .filter((level) => num(level.price) >= minFillPrice);
   const visibleDepth = round(levels.reduce((total, level) => total + level.price * level.size, 0), 6);
   if (!levels.length || visibleDepth < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC))) return null;
   let fillShares = 0;
@@ -3544,6 +4775,7 @@ function cloneWindowSnapshot(clone, reason = "archive") {
     pnl: round(pnl, 6),
     fillCount,
     orderCount,
+    fills: (clone.fills || []).slice(0, 120).map((fill) => ({ ...fill })),
     noTradeReason: cost <= 0 && fillCount <= 0 && orderCount <= 0 ? (lastDecision?.reason || "no paper order generated") : "",
     lastDecision,
     btc: clone.btc ? {
@@ -4719,6 +5951,8 @@ function renderDashboardHtml() {
       .replace('outside clone entry band', '不在克隆入场时间段')
       .replace('paper budget reached', '模拟预算已用完')
       .replace('market is not live', '市场未处于可交易状态')
+      .replace('direction gate blocked', '方向闸门拦截')
+      .replace('direction confirmed', '方向已确认')
       .replace('lowered minEdge because observed buys are being missed', '因漏掉观察买单，降低 minEdge')
       .replace('raised minEdge because clone is over-trading', '因模拟交易过多，提高 minEdge')
       .replace('moved entry earlier because clone fills are late', '因模拟成交偏晚，提前入场')
@@ -4769,11 +6003,75 @@ function renderDashboardHtml() {
       const portfolioCum = last.clonePortfolioCumulative || {};
       const assets = portfolio.assets || {};
       const summaries = portfolio.assetSummaries || [];
+      const pageBankroll = bankrollFromState();
+      if (pageBankroll > 0) {
+        const h1 = document.querySelector('h1');
+        if (h1) h1.textContent = fmt(pageBankroll, 0) + 'U 独立模拟盘';
+        document.title = fmt(pageBankroll, 0) + 'U 独立模拟盘';
+      }
       const legSummary = key => summaries.find(row => row.legKey === key) || {};
       const btc5 = assets.BTC5m || c || {};
       const btc15 = assets.BTC15m || {};
       const eth5 = assets.ETH5m || {};
       const eth15 = assets.ETH15m || {};
+      const portfolioClones = [btc5, btc15, eth5, eth15].filter(row => row && row.config);
+      const liveCloneFills = portfolioClones.flatMap(clone => (clone.fills || []).map(row => ({
+        ...row,
+        legKey: clone.legKey,
+        marketSlug: clone.market?.slug,
+        source: 'live'
+      })));
+      const archivedCloneFills = (last.cloneHistory || []).flatMap(win => {
+        if (!win || !win.slug) return [];
+        if (Array.isArray(win.fills) && win.fills.length) {
+          return win.fills.map(row => ({
+            ...row,
+            legKey: win.legKey || row.legKey,
+            marketSlug: win.slug,
+            archivedAt: win.archivedAt,
+            source: 'archive'
+          }));
+        }
+        const positions = win.positions || {};
+        return ['Up', 'Down'].flatMap(direction => {
+          const pos = positions[direction] || {};
+          const cost = Number(pos.cost) || 0;
+          const shares = Number(pos.shares) || 0;
+          if (cost <= 0 || shares <= 0) return [];
+          return [{
+            id: 'archive-' + win.slug + '-' + direction,
+            ts: Number(win.windowEnd) || (Date.parse(win.archivedAt || '') / 1000) || 0,
+            isoTime: win.archivedAt || '',
+            action: 'BUY',
+            direction,
+            style: 'archived',
+            price: Number(pos.avgPrice) || cost / shares,
+            amountUsdc: cost,
+            shares,
+            reason: 'archived window fill',
+            fillReason: 'derived from archived position',
+            fillRatio: null,
+            legKey: win.legKey || '',
+            marketSlug: win.slug,
+            archivedAt: win.archivedAt,
+            source: 'archive-derived'
+          }];
+        });
+      });
+      const fillSeen = new Set();
+      const allCloneFills = liveCloneFills.concat(archivedCloneFills)
+        .filter(row => {
+          const key = row.id || [row.marketSlug, row.legKey, row.direction, row.ts, row.amountUsdc, row.shares].join('|');
+          if (fillSeen.has(key)) return false;
+          fillSeen.add(key);
+          return true;
+        })
+        .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+      const allCloneOrders = portfolioClones.flatMap(clone => (clone.orders || []).map(row => ({
+        ...row,
+        legKey: clone.legKey,
+        marketSlug: clone.market?.slug,
+      }))).sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
       const btc15Summary = legSummary('BTC15m');
       const eth5Summary = legSummary('ETH5m');
       const eth15Summary = legSummary('ETH15m');
@@ -4864,14 +6162,19 @@ function renderDashboardHtml() {
       els.riskGuard.textContent = risk.reason ? '仅提示' : '运行中';
       els.riskGuard.className = risk.reason ? 'warn' : 'ok';
       els.openSample.textContent = btc.openPrice == null ? '-' : fmt(btc.openPrice) + ' / ' + esc(btc.openPriceSource || '-');
-      els.cloneFills.textContent = (c.fills || []).length;
+      const archivedFillCount = (last.cloneHistory || []).reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
+      const archivedTradeWindows = (last.cloneHistory || []).filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0).length;
+      const latestArchivedFill = (last.cloneHistory || []).find(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
+      els.cloneFills.textContent = '明细 ' + allCloneFills.length + ' / 归档笔数 ' + archivedFillCount + ' / 成交窗口 ' + archivedTradeWindows
+        + (latestArchivedFill?.archivedAt ? ' / 最新 ' + new Date(latestArchivedFill.archivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '');
       els.calibration.textContent = cal.observedBuyRows ? (cal.matchedRows + '/' + cal.observedBuyRows) : '-';
       const ac = adaptive.effectiveConfig || c.config || {};
       els.learnerStatus.textContent = (learner.currentObservedBuys ?? 0) + '笔 / 偏向 ' + dirText(learner.preferredOutcome || '-') + ' / 近30秒 ' + (learner.recentBuyRows30s ?? 0);
       els.versionInfo.textContent = (version.startedAt ? new Date(version.startedAt).toLocaleTimeString() : '已归零') + ' 起';
-      els.minTradeRule.textContent = '成交>= ' + esc(ac.minFillUsdc ?? 1) + 'U / 深度>= ' + esc(ac.minVisibleDepthUsdc ?? 1) + 'U / maker击穿 ' + esc(ac.makerPenetrationTicks ?? 1) + ' tick';
+      els.minTradeRule.textContent = '成交>= ' + esc(ac.minFillUsdc ?? 1) + 'U / 最低价>= ' + esc(ac.minFillPrice ?? 0.01) + ' / 深度>= ' + esc(ac.minVisibleDepthUsdc ?? 1) + 'U / maker击穿 ' + esc(ac.makerPenetrationTicks ?? 1) + ' tick';
       els.executionLatency.textContent = esc(ac.executionLatencyMs ?? 600) + 'ms / 快照后才允许成交';
-      els.adaptiveParams.textContent = '预算 ' + esc(ac.budgetUsdc ?? '-') + ' / 目标笔数 ' + esc(ac.targetOrderRows ?? '-') + ' / 探针 ' + esc(ac.probeOrderUsdc ?? '-') + ' / 单笔 ' + esc(ac.orderUsdc ?? '-') + ' / 最大 ' + esc(ac.maxClipUsdc ?? '-') + ' / 吃单费 ' + esc(ac.takerFeeRate ?? '-') + ' / 参与深度 ' + esc(ac.liquidityParticipation ?? '-') + ' / 退出 ' + esc(ac.exitEnabled ? '开' : '关') + ' / 反向 ' + esc(ac.hedgeEnabled ? '开' : '关');
+      const modeLabel = ac.smallBankrollMode ? '50U模式 ' + esc(ac.smallBankrollMode) + ' / ' : ac.liveReadyMode ? '实盘预备 ' + esc(ac.liveReadyMode) + ' / ' : '';
+      els.adaptiveParams.textContent = modeLabel + '预算 ' + esc(ac.budgetUsdc ?? '-') + ' / 目标笔数 ' + esc(ac.targetOrderRows ?? '-') + ' / 方向确认 ' + esc(ac.directionConfirmEnabled ? '开' : '关') + ' / 方向阈值 ' + esc(ac.directionMinDeltaBps ?? '-') + 'bps / 探针 ' + esc(ac.probeOrderUsdc ?? '-') + ' / 单笔 ' + esc(ac.orderUsdc ?? '-') + ' / 最大 ' + esc(ac.maxClipUsdc ?? '-') + ' / 吃单费 ' + esc(ac.takerFeeRate ?? '-') + ' / 参与深度 ' + esc(ac.liquidityParticipation ?? '-') + ' / 退出 ' + esc(ac.exitEnabled ? '开' : '关') + ' / 反向 ' + esc(ac.hedgeEnabled ? '开' : '关');
       els.cloneUnsettledWindows.textContent = cum.unsettledWindows ?? ((last.cloneHistory || []).filter(row => !row.settled).length);
       els.finalizedWindows.textContent = cum.finalizedWindows ?? 0;
       const wr = last.winrateComparison || {};
@@ -4909,6 +6212,7 @@ function renderDashboardHtml() {
       els.decision.innerHTML = '决策：<code>' + esc(statusText(d.status)) + '</code> ' + esc(reasonText(d.reason || '')) + ' | 上涨公允价=' + esc(d.fairUp ?? '-') + ' | 偏向=' + esc(dirText(d.preferred || '')) + ' | 盘口源=' + esc(ob.source || '-') + ' | BTC源=' + esc(btc.priceSource || btc.source || '-') + ' | 自适应=' + esc((adaptive.suggestions || []).join('; '));
       drawPnlChart();
       drawTotalPnlChart();
+      updateTotalTradeMeta();
       const q = els.filter.value.trim().toLowerCase();
       const rows = (last.trades || []).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
       els.rows.innerHTML = rows.map(row => {
@@ -4917,9 +6221,9 @@ function renderDashboardHtml() {
         const tx = row.tx ? '<code>' + esc(row.tx.slice(0,10) + '...' + row.tx.slice(-6)) + '</code>' : '';
         return '<tr><td>'+esc(row.isoTime)+'</td><td>'+esc(actionText(row.action))+'</td><td><code>'+esc(row.slug)+'</code></td><td>'+esc(dirText(row.direction))+'</td><td class="num">'+fmt(row.price,4)+'</td><td class="num">'+fmt(row.amountUsdc)+'</td><td class="num">'+fmt(row.shares)+'</td><td class="num '+pnlCls+'">'+pnl+'</td><td>'+esc(reasonText(row.reason))+'</td><td>'+tx+'</td></tr>';
       }).join('');
-      const fills = (c.fills || []).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
-      els.cloneFillRows.innerHTML = fills.map(row => '<tr><td>'+esc(row.isoTime)+'</td><td>'+esc(actionText(row.action))+'</td><td>'+esc(dirText(row.direction))+'</td><td>'+esc(styleText(row.style))+'</td><td class="num">'+fmt(row.price,4)+'</td><td class="num">'+fmt(row.amountUsdc)+'</td><td class="num">'+fmt(row.shares)+'</td><td>'+esc(reasonText(row.reason))+'<br><span class="muted">'+esc(reasonText(row.fillReason || ''))+' '+esc(row.fillRatio == null ? '' : '成交比例 '+row.fillRatio)+'</span></td></tr>').join('');
-      const orders = (c.orders || []).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
+      const fills = (allCloneFills.length ? allCloneFills : (c.fills || [])).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
+      els.cloneFillRows.innerHTML = fills.map(row => '<tr><td>'+esc(row.isoTime)+'</td><td>'+esc(actionText(row.action))+'</td><td>'+esc(dirText(row.direction))+'</td><td>'+esc(styleText(row.style))+'</td><td class="num">'+fmt(row.price,4)+'</td><td class="num">'+fmt(row.amountUsdc)+'</td><td class="num">'+fmt(row.shares)+'</td><td>'+esc(reasonText(row.reason))+'<br><span class="muted">'+esc(row.legKey || '')+' '+esc(row.marketSlug || '')+'</span><br><span class="muted">'+esc(reasonText(row.fillReason || ''))+' '+esc(row.fillRatio == null ? '' : '成交比例 '+row.fillRatio)+'</span></td></tr>').join('');
+      const orders = (allCloneOrders.length ? allCloneOrders : (c.orders || [])).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
       els.cloneOrderRows.innerHTML = orders.map(row => '<tr><td>'+esc(row.isoTime)+'</td><td>'+esc(statusText(row.status))+'</td><td>'+esc(dirText(row.direction))+'</td><td>'+esc(styleText(row.style))+'</td><td class="num">'+fmt(row.limitPrice,4)+'</td><td class="num">'+fmt(row.remainingShares ?? row.shares)+'</td><td>'+esc(reasonText(row.reason))+'</td></tr>').join('');
       const history = (last.cloneHistory || []).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
       els.cloneHistoryRows.innerHTML = history.map(row => {
@@ -4948,6 +6252,9 @@ function renderDashboardHtml() {
         pnl: Number(row.pnl) || 0,
         cost: Number(row.cost) || 0,
         fillCount: Number(row.fillCount) || 0,
+        archivedAt: row.archivedAt || '',
+        windowStart: row.windowStart,
+        windowEnd: row.windowEnd,
         winner: row.winner || '',
         settlementSource: row.settlementSource || row.archiveReason || '',
         noTradeReason: row.noTradeReason || '',
@@ -5132,13 +6439,66 @@ function renderDashboardHtml() {
       const legSummary = groups.map(group => group.label + ':' + signedFmt(group.points.reduce((total, row) => total + row.pnl, 0))).join(' | ');
       els.pnlChartMeta.textContent = '四盘口分图 | 最新 ' + chartLegLabel(lastPoint.legKey) + ' ' + fmt(lastPoint.pnl) + ' USDC | 最好 ' + chartLegLabel(best.legKey) + ' ' + fmt(best.pnl) + ' | 最差 ' + chartLegLabel(worst.legKey) + ' ' + fmt(worst.pnl) + ' | ' + legSummary + ' | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U';
     }
+    function bankrollFromState() {
+      const assets = Object.values(last.clonePortfolio?.assets || {});
+      const values = [last.clone?.config?.bankrollUsdc, ...assets.map(row => row?.config?.bankrollUsdc)]
+        .map(Number)
+        .filter(row => Number.isFinite(row) && row > 0);
+      return values.length ? values[0] : 0;
+    }
     function totalCurvePoints() {
       const points = chartPoints(1000);
-      let running = 0;
+      const bankroll = bankrollFromState();
+      if (!points.length && bankroll > 0) {
+        return [{
+          slug: '50u-start',
+          legKey: 'BANKROLL',
+          label: '50U 起始权益',
+          pnl: 0,
+          cost: 0,
+          fillCount: 0,
+          winner: '',
+          settlementSource: '',
+          noTradeReason: '',
+          settled: false,
+          current: true,
+          baseline: true,
+          startingBankroll: bankroll,
+          totalCumulative: bankroll,
+          totalPnl: 0,
+          totalIndex: 0
+        }];
+      }
+      let running = bankroll || 0;
       return points.map((point, idx) => {
         running += Number(point.pnl) || 0;
-        return { ...point, totalCumulative: running, totalIndex: idx };
+        return { ...point, startingBankroll: bankroll, totalCumulative: running, totalPnl: running - bankroll, totalIndex: idx };
       });
+    }
+    function updateTotalTradeMeta() {
+      if (!els.totalPnlChartMeta || !last) return;
+      const points = totalCurvePoints();
+      if (!points.length) return;
+      const bankroll = bankrollFromState();
+      const lastPoint = points[points.length - 1];
+      const highPoint = points.reduce((max, row) => row.totalCumulative > max.totalCumulative ? row : max, points[0]);
+      const lowPoint = points.reduce((min, row) => row.totalCumulative < min.totalCumulative ? row : min, points[0]);
+      const tradePoints = points.filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
+      const totalFillCount = tradePoints.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
+      const latestTradePoint = [...tradePoints].reverse()[0];
+      const today2030 = new Date();
+      today2030.setHours(20, 30, 0, 0);
+      const since2030 = tradePoints.filter(row => Date.parse(row.archivedAt || '') >= today2030.getTime());
+      const since2030Cost = since2030.reduce((total, row) => total + (Number(row.cost) || 0), 0);
+      const since2030Pnl = since2030.reduce((total, row) => total + (Number(row.pnl) || 0), 0);
+      const since2030Fills = since2030.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
+      const rh = last.hourlyPerformance?.rollingHour?.paper || {};
+      const latestTradeText = latestTradePoint?.archivedAt
+        ? '最新成交 ' + new Date(latestTradePoint.archivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '最新成交 -';
+      els.totalPnlChartMeta.textContent = bankroll > 0
+        ? '50U账户权益 | 窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText + ' | 20:30后 ' + since2030Fills + '笔 / 成本 ' + fmt(since2030Cost) + 'U / 盈亏 ' + signedFmt(since2030Pnl) + 'U | 最新权益 ' + fmt(lastPoint.totalCumulative) + 'U | 累计盈亏 ' + signedFmt(lastPoint.totalPnl) + 'U | 最高 ' + fmt(highPoint.totalCumulative) + 'U | 最低 ' + fmt(lowPoint.totalCumulative) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U'
+        : '总收益曲线 | 图内窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText;
     }
     function drawTotalPnlChart() {
       const canvas = els.totalPnlChart;
@@ -5162,16 +6522,21 @@ function renderDashboardHtml() {
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       ctx.font = '12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+      const bankroll = bankrollFromState();
       if (!points.length) {
         totalChartHitBoxes = [];
         hideTotalPnlTooltip();
         ctx.fillStyle = '#8b949e';
-        ctx.fillText('暂无总收益曲线数据', pad.left, pad.top + 24);
-        if (els.totalPnlChartMeta) els.totalPnlChartMeta.textContent = '等待新规则窗口归档或当前持仓生成。';
+        ctx.fillText(bankroll > 0 ? '50U 账户已启动，等待首个模拟窗口归档。' : '暂无总收益曲线数据', pad.left, pad.top + 24);
+        if (els.totalPnlChartMeta) els.totalPnlChartMeta.textContent = bankroll > 0
+          ? '50U 独立模拟正在运行，曲线会在首个持仓或归档窗口出现。'
+          : '等待新规则窗口归档或当前持仓生成。';
         return;
       }
-      let yMin = Math.min(0, ...points.map(row => row.totalCumulative));
-      let yMax = Math.max(0, ...points.map(row => row.totalCumulative));
+      const baseline = bankroll || 0;
+      const values = points.map(row => row.totalCumulative);
+      let yMin = Math.min(baseline, ...values);
+      let yMax = Math.max(baseline, ...values);
       if (yMin === yMax) {
         yMin -= 1;
         yMax += 1;
@@ -5181,7 +6546,7 @@ function renderDashboardHtml() {
       yMax += yMargin;
       const xAt = idx => pad.left + (points.length === 1 ? plotW / 2 : idx / (points.length - 1) * plotW);
       const yAt = value => pad.top + (yMax - value) / (yMax - yMin) * plotH;
-      const zeroY = yAt(0);
+      const zeroY = yAt(baseline);
       ctx.strokeStyle = '#24313d';
       ctx.lineWidth = 1;
       for (let i = 0; i <= 4; i += 1) {
@@ -5193,7 +6558,7 @@ function renderDashboardHtml() {
         const value = yMax - (yMax - yMin) * (i / 4);
         ctx.fillStyle = '#8b949e';
         ctx.textAlign = 'right';
-        ctx.fillText(signedFmt(value, 0), pad.left - 8, y + 4);
+        ctx.fillText(bankroll > 0 ? fmt(value, 0) : signedFmt(value, 0), pad.left - 8, y + 4);
       }
       ctx.strokeStyle = '#8b949e';
       ctx.beginPath();
@@ -5253,8 +6618,23 @@ function renderDashboardHtml() {
       const rh = last.hourlyPerformance?.rollingHour?.paper || {};
       const r24 = last.hourlyPerformance?.rolling24h?.paper || {};
       const totalBook = last.clonePortfolioCumulative?.totalPnlIncludingOpen ?? last.cloneVersionCumulative?.totalPnlIncludingOpen;
+      const tradePoints = points.filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
+      const totalFillCount = tradePoints.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
+      const latestTradePoint = [...tradePoints].reverse()[0];
+      const today2030 = new Date();
+      today2030.setHours(20, 30, 0, 0);
+      const since2030 = tradePoints.filter(row => Date.parse(row.archivedAt || '') >= today2030.getTime());
+      const since2030Cost = since2030.reduce((total, row) => total + (Number(row.cost) || 0), 0);
+      const since2030Pnl = since2030.reduce((total, row) => total + (Number(row.pnl) || 0), 0);
+      const since2030Fills = since2030.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
+      const latestTradeText = latestTradePoint?.archivedAt
+        ? '最新成交 ' + new Date(latestTradePoint.archivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '最新成交 -';
+      const since2030Text = '20:30后 ' + since2030Fills + '笔 / 成本 ' + fmt(since2030Cost) + 'U / 盈亏 ' + signedFmt(since2030Pnl) + 'U';
       if (els.totalPnlChartMeta) {
-        els.totalPnlChartMeta.textContent = '图内窗口 ' + points.length + ' 个 | 最新累计 ' + signedFmt(lastPoint.totalCumulative) + ' USDC | 最高 ' + signedFmt(highPoint.totalCumulative) + ' | 最低 ' + signedFmt(lowPoint.totalCumulative) + ' | 总账累计 ' + signedFmt(totalBook) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U';
+        els.totalPnlChartMeta.textContent = bankroll > 0
+          ? '50U账户权益 | 窗口 ' + points.length + ' 个 | 最新权益 ' + fmt(lastPoint.totalCumulative) + 'U | 累计盈亏 ' + signedFmt(lastPoint.totalPnl) + 'U | 最高 ' + fmt(highPoint.totalCumulative) + 'U | 最低 ' + fmt(lowPoint.totalCumulative) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U'
+          : '总收益曲线 | 图内窗口 ' + points.length + ' 个 | 最新累计 ' + signedFmt(lastPoint.totalCumulative) + ' USDC | 总账累计 ' + signedFmt(totalBook) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U';
       }
     }
     function hidePnlTooltip() {
@@ -5281,7 +6661,7 @@ function renderDashboardHtml() {
       const point = hit.point;
       const pnlClass = point.pnl >= 0 ? 'ok' : 'bad';
       const pnlLabel = point.pnl >= 0 ? '盈利' : '亏损';
-      const status = point.current ? '当前窗口' : point.settled ? '已结算' : '待结算';
+      const status = point.baseline ? '起始权益' : point.current ? '当前窗口' : point.settled ? '已结算' : '待结算';
       const winner = point.winner ? ' / 胜出 ' + dirText(point.winner) : '';
       tip.innerHTML =
         '<b>' + esc(point.label) + ' ' + esc(status) + esc(winner) + '</b>' +
@@ -5326,13 +6706,16 @@ function renderDashboardHtml() {
       }
       const point = hit.point;
       const pnlClass = point.pnl >= 0 ? 'ok' : 'bad';
-      const cumulativeClass = point.totalCumulative >= 0 ? 'ok' : 'bad';
+      const hasBankroll = Number(point.startingBankroll) > 0;
+      const cumulativePnl = hasBankroll ? Number(point.totalPnl) : Number(point.totalCumulative);
+      const cumulativeClass = cumulativePnl >= 0 ? 'ok' : 'bad';
       const status = point.current ? '当前窗口' : point.settled ? '已结算' : '待结算';
       const winner = point.winner ? ' / 胜出 ' + dirText(point.winner) : '';
       tip.innerHTML =
         '<b>' + esc(point.label) + ' ' + esc(status) + esc(winner) + '</b>' +
         '<div class="tipSlug">' + esc(point.slug) + '</div>' +
-        '<div class="tipRow"><span>总累计收益</span><span class="tipValue ' + cumulativeClass + '">' + signedFmt(point.totalCumulative) + ' USDC</span></div>' +
+        (hasBankroll ? '<div class="tipRow"><span>账户权益</span><span class="tipValue">' + fmt(point.totalCumulative) + ' USDC</span></div>' : '') +
+        '<div class="tipRow"><span>' + (hasBankroll ? '累计盈亏' : '总累计收益') + '</span><span class="tipValue ' + cumulativeClass + '">' + signedFmt(cumulativePnl) + ' USDC</span></div>' +
         '<div class="tipRow"><span>单窗口盈亏</span><span class="tipValue ' + pnlClass + '">' + signedFmt(point.pnl) + ' USDC</span></div>' +
         '<div class="tipRow"><span>投入成本</span><span class="tipValue">' + fmt(point.cost) + ' USDC</span></div>' +
         '<div class="tipRow"><span>成交笔数</span><span class="tipValue">' + esc(point.fillCount) + '</span></div>' +
@@ -5359,7 +6742,7 @@ function renderDashboardHtml() {
       els.totalPnlChart.addEventListener('mousemove', showTotalPnlTooltip);
       els.totalPnlChart.addEventListener('mouseleave', hideTotalPnlTooltip);
     }
-    window.addEventListener('resize', () => { if (last) { drawPnlChart(); drawTotalPnlChart(); } });
+    window.addEventListener('resize', () => { if (last) { drawPnlChart(); drawTotalPnlChart(); updateTotalTradeMeta(); } });
     load();
     setInterval(load, 5000);
   </script>
