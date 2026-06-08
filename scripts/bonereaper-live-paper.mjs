@@ -7,7 +7,7 @@
  * armed through the explicit guarded live switch.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { resolve, join } from "node:path";
@@ -47,7 +47,8 @@ const STRATEGY_VERSION_NAME = "v47 shadow live: guarded real-order switch";
 const SMALL_BANKROLL_STRATEGY_VERSION_ID = "portfolio-v38-50u-live-switch-guard";
 const SMALL_BANKROLL_STRATEGY_VERSION_NAME = "50U v38 shadow live: guarded real-order switch";
 const REAL_ORDER_CONFIRM_VALUE = "I_ACCEPT_50U_REAL_ORDERS";
-const REAL_ORDER_ADAPTERS = new Set(["none"]);
+const REAL_ORDER_ADAPTERS = new Set(["none", "clob"]);
+const REAL_ORDER_CREDS_FILE = resolve(process.cwd(), ".polymarket-creds.json");
 const LEDGER_RESET_ID = "full-ledger-reset-v1-hourly";
 const LEDGER_RESET_NAME = "总账重置：从新规则小时收益率版本重新计数";
 const feeRateCache = new Map();
@@ -120,23 +121,60 @@ function normalizeRealOrderAdapter(value) {
   return REAL_ORDER_ADAPTERS.has(adapter) ? adapter : "none";
 }
 
+function unquoteEnvValue(value) {
+  const text = String(value || "").trim();
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
+
+function loadLocalEnvFile() {
+  const candidates = [
+    resolve(process.cwd(), ".env"),
+    resolve(process.cwd(), ".env.local"),
+  ];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    try {
+      const text = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq <= 0) continue;
+        const key = trimmed.slice(0, eq).trim();
+        const value = unquoteEnvValue(trimmed.slice(eq + 1));
+        if (!key || value === "" || process.env[key]) continue;
+        process.env[key] = value;
+      }
+      return file;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
 function buildRealOrderSwitchFromConfig(cfg = {}, readiness = null) {
   const requested = Boolean(cfg.realOrderRequested);
   const envEnabled = Boolean(cfg.realOrderEnvEnabled);
   const confirmOk = Boolean(cfg.realOrderConfirmOk);
   const adapter = normalizeRealOrderAdapter(cfg.realOrderAdapter);
-  const adapterReady = false;
+  const adapterReady = adapter === "clob";
   const requireLiveGate = cfg.realOrderRequireLiveGate !== false;
+  const smallBankrollOnly = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
   const maxBudgetUsdc = round(Math.max(0, num(cfg.realOrderMaxBudgetUsdc, 0)), 2);
   const dailyLossLimitUsdc = round(Math.max(0, num(cfg.realOrderDailyLossLimitUsdc, 0)), 2);
   const blockers = [];
   if (!requested) blockers.push("not requested by --clone-real-orders");
   if (!envEnabled) blockers.push("BONEREAPER_REAL_ORDERS is not enabled");
   if (!confirmOk) blockers.push(`BONEREAPER_REAL_ORDERS_CONFIRM must equal ${REAL_ORDER_CONFIRM_VALUE}`);
-  if (adapter !== "none") blockers.push(`unsupported real-order adapter: ${adapter}`);
-  if (!adapterReady) blockers.push("real CLOB order adapter is not wired in this paper mirror");
+  if (!smallBankrollOnly) blockers.push("real orders are limited to 50U/small-bankroll mode");
+  if (adapter === "none") blockers.push("real-order adapter is none; set --clone-real-order-adapter clob");
+  if (!adapterReady && adapter !== "none") blockers.push(`unsupported real-order adapter: ${adapter}`);
   if (requireLiveGate && readiness && !readiness.ready) blockers.push("LiveGate not ready");
-  const armed = requested && envEnabled && confirmOk;
+  const armed = requested && envEnabled && confirmOk && smallBankrollOnly;
   const realOrderSubmitAllowed = armed && adapterReady && (!requireLiveGate || !readiness || readiness.ready);
   return {
     requested,
@@ -249,6 +287,7 @@ function parseArgs(argv) {
     cloneLegCaps: {},
     cloneRealOrders: false,
     cloneRealOrderAdapter: "none",
+    cloneRealOrderType: "FOK",
     cloneRealOrderRequireLiveGate: true,
     cloneRealOrderMaxBudgetUsdc: 50,
     cloneRealOrderDailyLossLimitUsdc: 5,
@@ -362,6 +401,7 @@ function parseArgs(argv) {
     else if (arg === "--clone-real-orders") opts.cloneRealOrders = true;
     else if (arg === "--no-clone-real-orders") opts.cloneRealOrders = false;
     else if (arg.startsWith("--clone-real-order-adapter")) opts.cloneRealOrderAdapter = String(readValue()).trim();
+    else if (arg.startsWith("--clone-real-order-type")) opts.cloneRealOrderType = String(readValue()).trim().toUpperCase();
     else if (arg === "--clone-real-order-require-live-gate") opts.cloneRealOrderRequireLiveGate = true;
     else if (arg === "--clone-real-order-ignore-live-gate") opts.cloneRealOrderRequireLiveGate = false;
     else if (arg.startsWith("--clone-real-order-max-budget-usdc")) opts.cloneRealOrderMaxBudgetUsdc = Number(readValue());
@@ -457,6 +497,9 @@ function parseArgs(argv) {
   opts.cloneLegCaps = normalizeCloneLegCaps(opts.cloneLegCaps);
   opts.cloneRealOrders = Boolean(opts.cloneRealOrders);
   opts.cloneRealOrderAdapter = normalizeRealOrderAdapter(opts.cloneRealOrderAdapter);
+  opts.cloneRealOrderType = ["FOK", "FAK"].includes(String(opts.cloneRealOrderType || "").toUpperCase())
+    ? String(opts.cloneRealOrderType).toUpperCase()
+    : "FOK";
   opts.cloneRealOrderRequireLiveGate = opts.cloneRealOrderRequireLiveGate !== false;
   opts.cloneRealOrderMaxBudgetUsdc = clampNum(opts.cloneRealOrderMaxBudgetUsdc, 0, 50, 50);
   opts.cloneRealOrderDailyLossLimitUsdc = clampNum(opts.cloneRealOrderDailyLossLimitUsdc, 0, 50, 5);
@@ -491,8 +534,10 @@ Options:
   --clone-daily-loss-limit-usdc <n>  Pause after daily paper loss. Default: 5000
   --no-clone-adaptive         Disable small adaptive parameter tuning
   --clone-real-orders         Arm guarded real-order switch; still requires env confirmation
+  --clone-real-order-adapter clob  Use the CLOB live adapter. Default: none
+  --clone-real-order-type FOK|FAK  Real order type. Default: FOK
   --clone-real-order-max-budget-usdc <n>  Hard real-order budget cap. Default/max: 50
-  --clone-real-order-daily-loss-limit-usdc <n>  Real-order daily loss breaker. Default: 5
+  --clone-real-order-daily-loss-limit-usdc <n>  Reserved for later loss breaker. Default: 5
   --clone-real-order-ignore-live-gate  Do not require LiveGate readiness for switch state
   Env confirmation for real orders:
     BONEREAPER_REAL_ORDERS=1
@@ -1239,6 +1284,7 @@ function cloneConfig(opts) {
     realOrderEnvEnabled: envFlag("BONEREAPER_REAL_ORDERS"),
     realOrderConfirmOk: String(process.env.BONEREAPER_REAL_ORDERS_CONFIRM || "").trim() === REAL_ORDER_CONFIRM_VALUE,
     realOrderAdapter: normalizeRealOrderAdapter(opts.cloneRealOrderAdapter),
+    realOrderType: opts.cloneRealOrderType,
     realOrderRequireLiveGate: opts.cloneRealOrderRequireLiveGate !== false,
     realOrderMaxBudgetUsdc: opts.cloneRealOrderMaxBudgetUsdc,
     realOrderDailyLossLimitUsdc: opts.cloneRealOrderDailyLossLimitUsdc,
@@ -2478,7 +2524,7 @@ async function refreshOneCloneEngine(state, clone, opts, nowSec) {
       updateClonePnl(state, clone);
     }
     evaluateCloneRisk(state, clone);
-    generateCloneOrders(clone, nowSec);
+    await generateCloneOrders(clone, nowSec);
     fillOpenCloneOrders(clone, nowSec);
     updateClonePnl(state, clone);
     updateCloneAdverseSelection(clone, nowSec);
@@ -3209,6 +3255,229 @@ function markShadowLivePaperOrder(clone, order, paperStatus, extra = {}) {
   if (Number.isFinite(num(extra.fillShares, NaN))) row.paperFillShares = round(extra.fillShares, 6);
   if (extra.reason) row.paperReason = extra.reason;
   clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+}
+
+const realOrderRuntime = {
+  modules: null,
+  client: null,
+  initError: "",
+};
+
+function compactAddress(value) {
+  const text = String(value || "").trim();
+  return text.length > 12 ? `${text.slice(0, 6)}...${text.slice(-4)}` : text;
+}
+
+function loadRealOrderCredsFromFile() {
+  if (!existsSync(REAL_ORDER_CREDS_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(REAL_ORDER_CREDS_FILE, "utf8"));
+    if (!raw?.key || !raw?.secret || !raw?.passphrase) return null;
+    return {
+      key: String(raw.key),
+      secret: String(raw.secret),
+      passphrase: String(raw.passphrase),
+      address: typeof raw.address === "string" ? raw.address : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadRealOrderCredsFromEnv() {
+  const key = String(process.env.POLYMARKET_API_KEY || "").trim();
+  const secret = String(process.env.POLYMARKET_API_SECRET || "").trim();
+  const passphrase = String(process.env.POLYMARKET_API_PASSPHRASE || "").trim();
+  if (!key || !secret || !passphrase) return null;
+  return { key, secret, passphrase, address: "" };
+}
+
+function adaptEthersSigner(wallet) {
+  return {
+    _signTypedData: (domain, types, value) => wallet.signTypedData(domain, types, value),
+    getAddress: () => Promise.resolve(wallet.address),
+  };
+}
+
+function realOrderSignatureType(SignatureType) {
+  const mode = String(process.env.POLYMARKET_SIGNATURE_TYPE || "auto").trim().toLowerCase();
+  if (mode === "eoa") return SignatureType.EOA;
+  if (mode === "safe") return SignatureType.POLY_GNOSIS_SAFE;
+  if (mode === "1271") return SignatureType.POLY_1271;
+  if (mode === "proxy") return SignatureType.POLY_PROXY;
+  return String(process.env.POLYMARKET_PROXY_ADDRESS || "").trim() ? SignatureType.POLY_PROXY : SignatureType.EOA;
+}
+
+async function ensureRealOrderModules() {
+  if (realOrderRuntime.modules) return realOrderRuntime.modules;
+  const [clob, ethersModule] = await Promise.all([
+    import("@polymarket/clob-client-v2"),
+    import("ethers"),
+  ]);
+  realOrderRuntime.modules = {
+    ClobClient: clob.ClobClient,
+    Chain: clob.Chain,
+    Side: clob.Side,
+    OrderType: clob.OrderType,
+    SignatureType: clob.SignatureTypeV2 || clob.SignatureType,
+    ethers: ethersModule.ethers,
+  };
+  return realOrderRuntime.modules;
+}
+
+async function ensureRealOrderClient() {
+  if (realOrderRuntime.client) return realOrderRuntime.client;
+  try {
+    const modules = await ensureRealOrderModules();
+    const privateKey = String(process.env.POLYMARKET_PRIVATE_KEY || "").trim();
+    if (!privateKey) throw new Error("POLYMARKET_PRIVATE_KEY is not set");
+    const proxyAddress = String(process.env.POLYMARKET_PROXY_ADDRESS || "").trim();
+    const wallet = new modules.ethers.Wallet(privateKey);
+    const signer = adaptEthersSigner(wallet);
+    const signatureType = realOrderSignatureType(modules.SignatureType);
+    const funderAddress = proxyAddress || undefined;
+    let creds = loadRealOrderCredsFromEnv() || loadRealOrderCredsFromFile();
+    if (creds?.address && creds.address.toLowerCase() !== wallet.address.toLowerCase()) {
+      creds = null;
+    }
+    if (!creds) {
+      const keyClient = new modules.ClobClient({
+        host: CLOB_API_URL,
+        chain: modules.Chain.POLYGON,
+        signer,
+        signatureType,
+        funderAddress,
+      });
+      const derived = await keyClient.createOrDeriveApiKey();
+      creds = {
+        key: derived.key,
+        secret: derived.secret,
+        passphrase: derived.passphrase,
+        address: wallet.address,
+      };
+      await writeFile(REAL_ORDER_CREDS_FILE, `${JSON.stringify(creds, null, 2)}\n`, "utf8");
+    }
+    realOrderRuntime.client = new modules.ClobClient({
+      host: CLOB_API_URL,
+      chain: modules.Chain.POLYGON,
+      signer,
+      creds: {
+        key: creds.key,
+        secret: creds.secret,
+        passphrase: creds.passphrase,
+      },
+      signatureType,
+      funderAddress,
+    });
+    realOrderRuntime.initError = "";
+    console.log(`[RealOrder] CLOB adapter ready signer=${compactAddress(wallet.address)} proxy=${compactAddress(proxyAddress)} type=${String(signatureType)}`);
+    return realOrderRuntime.client;
+  } catch (err) {
+    realOrderRuntime.initError = err instanceof Error ? err.message : String(err);
+    throw err;
+  }
+}
+
+function floorToDecimals(value, decimals) {
+  const factor = 10 ** Math.max(0, decimals);
+  return Math.floor((num(value) + Number.EPSILON) * factor) / factor;
+}
+
+function getDecimalPlaces(value) {
+  const text = String(value || "");
+  const [, decimals = ""] = text.split(".");
+  return decimals.replace(/0+$/, "").length;
+}
+
+function extractOrderError(result) {
+  const obj = result && typeof result === "object" ? result : {};
+  for (const key of ["error", "message", "errorMsg", "errorMessage"]) {
+    const value = obj[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function safeRealOrderResult(result) {
+  if (!result || typeof result !== "object") return result || null;
+  const out = {};
+  for (const key of ["status", "orderID", "takingAmount", "makingAmount", "transactionsHashes", "success", "error", "message", "errorMsg", "errorMessage"]) {
+    if (key in result) out[key] = result[key];
+  }
+  return out;
+}
+
+function realOrderTypeValue(OrderType, cfg) {
+  const type = String(cfg.realOrderType || "FOK").toUpperCase();
+  return type === "FAK" ? OrderType.FAK : OrderType.FOK;
+}
+
+async function submitReal50uOrder(clone, shadowOrder, spec = {}) {
+  const cfg = clone?.config || {};
+  const realSwitch = cfg.realOrderSwitch || shadowOrder?.realOrderSwitch || buildRealOrderSwitchFromConfig(cfg, cfg.liveTradeReadiness);
+  if (!realSwitch.realOrderSubmitAllowed) return null;
+  const smallBankroll = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
+  if (!smallBankroll) return null;
+  const candidate = spec.candidate || {};
+  const quote = spec.quote || clone.orderbook?.[candidate.outcome];
+  const preflight = spec.preflight || {};
+  const tokenId = String(quote?.tokenId || clone.market?.outcomeTokenIds?.[candidate.outcome] || "");
+  const notional = floorToDecimals(Math.min(num(spec.notional, num(preflight.notional)), num(realSwitch.maxBudgetUsdc, 50)), 2);
+  const limitPrice = num(spec.limitPrice, num(preflight.limitPrice, NaN));
+  const orderRecord = {
+    attemptedAt: new Date().toISOString(),
+    adapter: "clob",
+    orderType: String(cfg.realOrderType || "FOK").toUpperCase(),
+    status: "ATTEMPTING",
+    tokenId,
+    direction: candidate.outcome || shadowOrder?.direction || "",
+    amountUsdc: notional,
+    limitPrice: Number.isFinite(limitPrice) ? round(limitPrice, 6) : null,
+    bookAgeMs: preflight.bookAgeMs ?? null,
+    error: "",
+    result: null,
+  };
+  shadowOrder.realOrder = orderRecord;
+  shadowOrder.realOrderSubmitted = false;
+  try {
+    if (!tokenId) throw new Error("missing CLOB tokenId");
+    if (!Number.isFinite(notional) || notional < POLYMARKET_MIN_ORDER_USDC) throw new Error(`real order notional ${notional} below ${POLYMARKET_MIN_ORDER_USDC} USDC`);
+    if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice > 0.99) throw new Error(`invalid limit price ${limitPrice}`);
+    const ageMs = num(preflight.bookAgeMs, Infinity);
+    if (!Number.isFinite(ageMs) || ageMs > num(cfg.liveReadyMaxBookAgeMs, 1000)) throw new Error(`book stale before real order: ${ageMs}ms`);
+    const modules = await ensureRealOrderModules();
+    const client = await ensureRealOrderClient();
+    const tickSize = await client.getTickSize(tokenId);
+    const normalizedPrice = floorToDecimals(limitPrice, getDecimalPlaces(tickSize));
+    const signedOrder = await client.createMarketOrder(
+      {
+        tokenID: tokenId,
+        side: modules.Side.BUY,
+        amount: notional,
+        price: normalizedPrice,
+      },
+      { tickSize, negRisk: false },
+    );
+    const result = await client.postOrder(signedOrder, realOrderTypeValue(modules.OrderType, cfg));
+    const orderError = extractOrderError(result);
+    orderRecord.result = safeRealOrderResult(result);
+    orderRecord.status = orderError || result?.status === 400 ? "REJECTED" : String(result?.status || "POSTED").toUpperCase();
+    orderRecord.orderID = typeof result?.orderID === "string" ? result.orderID : "";
+    orderRecord.error = orderError;
+    shadowOrder.realOrderSubmitted = !orderError && result?.status !== 400;
+    shadowOrder.readOnly = !shadowOrder.realOrderSubmitted;
+    shadowOrder.updatedAt = new Date().toISOString();
+    clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+    return orderRecord;
+  } catch (err) {
+    orderRecord.status = "ERROR";
+    orderRecord.error = err instanceof Error ? err.message : String(err);
+    shadowOrder.realOrderSubmitted = false;
+    shadowOrder.readOnly = true;
+    shadowOrder.updatedAt = new Date().toISOString();
+    clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+    return orderRecord;
+  }
 }
 
 function orderbookTickSize(quote) {
@@ -5793,7 +6062,7 @@ function generateCloneExits(clone, nowSec) {
   return sold;
 }
 
-function generateCloneOrders(clone, nowSec) {
+async function generateCloneOrders(clone, nowSec) {
   const market = clone.market;
   const start = num(market?.windowStart, null);
   const end = num(market?.windowEnd, null);
@@ -6866,6 +7135,9 @@ function generateCloneOrders(clone, nowSec) {
       shadowOrder = recordShadowLiveOrder(clone, { nowSec, candidate, quote, limitPrice, notional: cappedNotional, preflight });
       if (!shadowOrder) continue;
       if (preflight.status !== "WOULD_SUBMIT_FILL") continue;
+      if (shadowOrder.realOrderSwitch?.realOrderSubmitAllowed) {
+        await submitReal50uOrder(clone, shadowOrder, { candidate, quote, limitPrice, notional: cappedNotional, preflight });
+      }
       if (num(candidate.edge) >= num(cfg.minExpectedEdge)) {
         releaseMakerOrdersForCross(clone, candidate.outcome, nowSec, "released stale maker orders for marketable paper entry");
       }
@@ -9751,6 +10023,7 @@ async function sleep(ms) {
 }
 
 async function main() {
+  const envFile = loadLocalEnvFile();
   const opts = parseArgs(process.argv.slice(2));
   if (await restartWithNodeProxyIfNeeded(opts)) return;
   await ensureDir(opts.out);
@@ -9774,6 +10047,7 @@ async function main() {
   let lastActivityPollMs = 0;
 
   console.log(`Bonereaper live paper started: ${opts.out}`);
+  if (envFile) console.log(`Env loaded: ${envFile}`);
   console.log(`Real-order switch: ${state.liveOrderSwitch.mode}; submitAllowed=${state.liveOrderSwitch.realOrderSubmitAllowed ? "yes" : "no"}.`);
   if (state.liveOrderSwitch.blockers?.length) {
     console.log(`Real-order blockers: ${state.liveOrderSwitch.blockers.join("; ")}`);

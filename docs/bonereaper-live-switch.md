@@ -26,12 +26,14 @@ BONEREAPER_REAL_ORDERS=1
 BONEREAPER_REAL_ORDERS_CONFIRM=I_ACCEPT_50U_REAL_ORDERS
 ```
 
-## Current Safety State
+The live adapter also requires installed dependencies:
 
-The switch records `realOrderSwitch` in `dashboard-state.json` and each Shadow Live FAK/IOC order. The current paper mirror still has no real CLOB order adapter wired, so `realOrderSubmitAllowed` remains false and the blocker is explicit:
-
-```text
-real CLOB order adapter is not wired in this paper mirror
+```powershell
+npm install
 ```
 
-Do not treat `-Mode live` as a real trading launch until a broker adapter is added and validated.
+## Current Safety State
+
+The switch records `realOrderSwitch` in `dashboard-state.json` and each Shadow Live FAK/IOC order. The 50U CLOB adapter is lazy-loaded and only runs when the switch is armed with `--clone-real-order-adapter clob`.
+
+Loss-based circuit breakers are intentionally not enabled in this version. Add them only after an explicit follow-up decision.

@@ -49,8 +49,9 @@ function Invoke-BonereaperLive {
   if ($Mode -eq "live") {
     $args += @(
       "--clone-real-orders",
-      "--clone-real-order-max-budget-usdc", "50",
-      "--clone-real-order-daily-loss-limit-usdc", "5"
+      "--clone-real-order-adapter", "clob",
+      "--clone-real-order-type", "FOK",
+      "--clone-real-order-max-budget-usdc", "50"
     )
   }
 

@@ -1,0 +1,14 @@
+{
+  "name": "bonereaper-paper-simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bonereaper:50u": "node scripts/bonereaper-live-paper.mjs --auto-btc5m --out bonereaper-live-50u --clone-bankroll-usdc 50",
+    "bonereaper:50u:switch": "powershell -ExecutionPolicy Bypass -File scripts/start-bonereaper-live-switch.ps1 -Target 50u"
+  },
+  "dependencies": {
+    "@polymarket/clob-client-v2": "^1.0.0",
+    "ethers": "^6.0.0"
+  }
+}

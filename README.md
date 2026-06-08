@@ -18,15 +18,16 @@ BTC/ETH Up or Down 5m/15m markets. It defaults to paper/shadow mode.
 
 The simulator reads public Polymarket/Gamma/Data API data and writes local
 HTML/JSON state files. Real-order submission is guarded by an explicit switch,
-environment confirmation, LiveGate checks, and a hard 50U budget cap. The current
-paper mirror still has no real CLOB order adapter wired, so the switch records
-blockers and `realOrderSubmitAllowed` remains false.
+environment confirmation, LiveGate checks, and a hard 50U budget cap. The CLOB
+adapter is limited to the 50U/small-bankroll mode and only submits strict
+FOK/FAK orders after Shadow Live confirms fresh WebSocket depth.
 
 ## What v47/v38 Includes
 
 - Main and 50U version IDs for the latest shadow-live FAK/IOC simulator.
 - A guarded real-order switch with explicit `BONEREAPER_REAL_ORDERS` and
   `BONEREAPER_REAL_ORDERS_CONFIRM=I_ACCEPT_50U_REAL_ORDERS` confirmation.
+- A lazy-loaded 50U-only CLOB live adapter using `@polymarket/clob-client-v2`.
 - Per-order `realOrderSwitch` status in Shadow Live FAK/IOC records.
 - 50U live-switch PowerShell launcher.
 - BTC/ETH 5m and 15m portfolio simulation.
@@ -53,8 +54,16 @@ Guarded 50U switch launcher:
 powershell -ExecutionPolicy Bypass -File scripts\start-bonereaper-live-switch.ps1 -Target 50u -Mode paper
 ```
 
-To arm the live switch state without bypassing blockers:
+Install live adapter dependencies before live mode:
+
+```powershell
+npm install
+```
+
+To arm the 50U CLOB live adapter:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\start-bonereaper-live-switch.ps1 -Target 50u -Mode live -Confirm50uLive
 ```
+
+Loss-based circuit breakers are not enabled in this version.
