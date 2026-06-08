@@ -2,21 +2,21 @@
 /**
  * Live paper mirror for the Bonereaper wallet.
  *
- * This process only reads public Polymarket activity endpoints and writes local
- * HTML/JSON files. It never imports the trading server and never submits orders.
+ * This process reads public Polymarket activity endpoints and writes local
+ * HTML/JSON files. Real-order submission is disabled by default and can only be
+ * armed through the explicit guarded live switch.
  */
 
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { resolve, join } from "node:path";
-import { promisify } from "node:util";
 import process from "node:process";
 
-const execFileAsync = promisify(execFile);
 const DATA_API_URL = "https://data-api.polymarket.com";
 const GAMMA_API_URL = "https://gamma-api.polymarket.com";
 const CLOB_API_URL = "https://clob.polymarket.com";
+const CLOB_WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const POLYMARKET_WEB_URL = "https://polymarket.com";
 const CODEX_RUNTIME_PYTHON = join(
   process.env.USERPROFILE || "",
@@ -42,13 +42,30 @@ const ACTIVITY_TYPES = ["TRADE", "REDEEM"];
 const OUTCOMES = ["Up", "Down"];
 const POLYMARKET_MIN_ORDER_USDC = 5;
 const POLYMARKET_MIN_ORDER_SHARES = 5;
-const STRATEGY_VERSION_ID = "portfolio-v27-min5u-defensive-budget-floor";
-const STRATEGY_VERSION_NAME = "v27 min-5U floor: defensive budgets and order caps cannot fall below exchange minimum";
-const SMALL_BANKROLL_STRATEGY_VERSION_ID = "portfolio-v22-50u-min5u-realistic";
-const SMALL_BANKROLL_STRATEGY_VERSION_NAME = "50U v22 min-5U realistic orders: fewer entries, real-size risk checks";
+const STRATEGY_VERSION_ID = "portfolio-v47-live-switch-guard";
+const STRATEGY_VERSION_NAME = "v47 shadow live: guarded real-order switch";
+const SMALL_BANKROLL_STRATEGY_VERSION_ID = "portfolio-v38-50u-live-switch-guard";
+const SMALL_BANKROLL_STRATEGY_VERSION_NAME = "50U v38 shadow live: guarded real-order switch";
+const REAL_ORDER_CONFIRM_VALUE = "I_ACCEPT_50U_REAL_ORDERS";
+const REAL_ORDER_ADAPTERS = new Set(["none"]);
 const LEDGER_RESET_ID = "full-ledger-reset-v1-hourly";
 const LEDGER_RESET_NAME = "总账重置：从新规则小时收益率版本重新计数";
 const feeRateCache = new Map();
+const marketWsOrderbook = {
+  socket: null,
+  status: "idle",
+  wantedAssetIds: new Set(),
+  subscribedAssetIds: new Set(),
+  books: new Map(),
+  openTimer: null,
+  pingTimer: null,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  lastOpenAt: "",
+  lastMessageAt: "",
+  lastError: "",
+  messages: 0,
+};
 
 function strategyVersionForOpts(opts = {}) {
   const bankroll = num(opts.cloneBankrollUsdc, 0);
@@ -91,6 +108,52 @@ function normalizeCloneLegCaps(caps) {
     normalized[key] = round(Math.max(0, cap), 2);
   }
   return normalized;
+}
+
+function envFlag(name) {
+  const value = String(process.env[name] || "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+function normalizeRealOrderAdapter(value) {
+  const adapter = String(value || "none").trim().toLowerCase();
+  return REAL_ORDER_ADAPTERS.has(adapter) ? adapter : "none";
+}
+
+function buildRealOrderSwitchFromConfig(cfg = {}, readiness = null) {
+  const requested = Boolean(cfg.realOrderRequested);
+  const envEnabled = Boolean(cfg.realOrderEnvEnabled);
+  const confirmOk = Boolean(cfg.realOrderConfirmOk);
+  const adapter = normalizeRealOrderAdapter(cfg.realOrderAdapter);
+  const adapterReady = false;
+  const requireLiveGate = cfg.realOrderRequireLiveGate !== false;
+  const maxBudgetUsdc = round(Math.max(0, num(cfg.realOrderMaxBudgetUsdc, 0)), 2);
+  const dailyLossLimitUsdc = round(Math.max(0, num(cfg.realOrderDailyLossLimitUsdc, 0)), 2);
+  const blockers = [];
+  if (!requested) blockers.push("not requested by --clone-real-orders");
+  if (!envEnabled) blockers.push("BONEREAPER_REAL_ORDERS is not enabled");
+  if (!confirmOk) blockers.push(`BONEREAPER_REAL_ORDERS_CONFIRM must equal ${REAL_ORDER_CONFIRM_VALUE}`);
+  if (adapter !== "none") blockers.push(`unsupported real-order adapter: ${adapter}`);
+  if (!adapterReady) blockers.push("real CLOB order adapter is not wired in this paper mirror");
+  if (requireLiveGate && readiness && !readiness.ready) blockers.push("LiveGate not ready");
+  const armed = requested && envEnabled && confirmOk;
+  const realOrderSubmitAllowed = armed && adapterReady && (!requireLiveGate || !readiness || readiness.ready);
+  return {
+    requested,
+    armed,
+    envEnabled,
+    confirmOk,
+    adapter,
+    adapterReady,
+    requireLiveGate,
+    maxBudgetUsdc,
+    dailyLossLimitUsdc,
+    submitAllowed: realOrderSubmitAllowed,
+    realOrderSubmitAllowed,
+    mode: realOrderSubmitAllowed ? "real-submit" : armed ? "armed-read-only" : "read-only",
+    confirmValue: REAL_ORDER_CONFIRM_VALUE,
+    blockers,
+  };
 }
 
 function parseArgs(argv) {
@@ -158,6 +221,19 @@ function parseArgs(argv) {
     cloneLiquidityParticipation: 0.35,
     cloneExecutionLatencyMs: 600,
     cloneQueueDelaySec: 1,
+    cloneBookStaleAfterMs: 2500,
+    cloneTakerDepthHaircut: 0.72,
+    cloneMakerDepthHaircut: 0.42,
+    cloneMakerQueueAheadPct: 0.72,
+    cloneAllowSnapshotTakerFill: false,
+    cloneAllowSyntheticFallbackFill: false,
+    cloneUseWebSocketOrderbook: true,
+    cloneRequireWebSocketCrossFill: true,
+    cloneLiveReadyMaxBookAgeMs: 1000,
+    cloneLiveReadyMinWindows: 48,
+    cloneLiveReadyMinFokOrders: 8,
+    cloneLiveReadyMinFokFillRate: 0.35,
+    cloneLiveReadyMaxAdverseRate: 0.45,
     cloneMinFillUsdc: POLYMARKET_MIN_ORDER_USDC,
     cloneMinFillPrice: 0.01,
     cloneLateEntryBufferSec: 4,
@@ -171,6 +247,11 @@ function parseArgs(argv) {
     cloneAdaptive: true,
     cloneBankrollUsdc: 0,
     cloneLegCaps: {},
+    cloneRealOrders: false,
+    cloneRealOrderAdapter: "none",
+    cloneRealOrderRequireLiveGate: true,
+    cloneRealOrderMaxBudgetUsdc: 50,
+    cloneRealOrderDailyLossLimitUsdc: 5,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -247,6 +328,23 @@ function parseArgs(argv) {
     else if (arg.startsWith("--clone-liquidity-participation")) opts.cloneLiquidityParticipation = Number(readValue());
     else if (arg.startsWith("--clone-execution-latency-ms")) opts.cloneExecutionLatencyMs = Number(readValue());
     else if (arg.startsWith("--clone-queue-delay-sec")) opts.cloneQueueDelaySec = Number(readValue());
+    else if (arg.startsWith("--clone-book-stale-after-ms")) opts.cloneBookStaleAfterMs = Number(readValue());
+    else if (arg.startsWith("--clone-taker-depth-haircut")) opts.cloneTakerDepthHaircut = Number(readValue());
+    else if (arg.startsWith("--clone-maker-depth-haircut")) opts.cloneMakerDepthHaircut = Number(readValue());
+    else if (arg.startsWith("--clone-maker-queue-ahead-pct")) opts.cloneMakerQueueAheadPct = Number(readValue());
+    else if (arg === "--clone-allow-snapshot-taker-fill") opts.cloneAllowSnapshotTakerFill = true;
+    else if (arg === "--no-clone-allow-snapshot-taker-fill") opts.cloneAllowSnapshotTakerFill = false;
+    else if (arg === "--clone-allow-synthetic-fallback-fill") opts.cloneAllowSyntheticFallbackFill = true;
+    else if (arg === "--no-clone-allow-synthetic-fallback-fill") opts.cloneAllowSyntheticFallbackFill = false;
+    else if (arg === "--clone-use-websocket-orderbook") opts.cloneUseWebSocketOrderbook = true;
+    else if (arg === "--no-clone-use-websocket-orderbook") opts.cloneUseWebSocketOrderbook = false;
+    else if (arg === "--clone-require-websocket-cross-fill") opts.cloneRequireWebSocketCrossFill = true;
+    else if (arg === "--no-clone-require-websocket-cross-fill") opts.cloneRequireWebSocketCrossFill = false;
+    else if (arg.startsWith("--clone-live-ready-max-book-age-ms")) opts.cloneLiveReadyMaxBookAgeMs = Number(readValue());
+    else if (arg.startsWith("--clone-live-ready-min-windows")) opts.cloneLiveReadyMinWindows = Number(readValue());
+    else if (arg.startsWith("--clone-live-ready-min-fok-orders")) opts.cloneLiveReadyMinFokOrders = Number(readValue());
+    else if (arg.startsWith("--clone-live-ready-min-fok-fill-rate")) opts.cloneLiveReadyMinFokFillRate = Number(readValue());
+    else if (arg.startsWith("--clone-live-ready-max-adverse-rate")) opts.cloneLiveReadyMaxAdverseRate = Number(readValue());
     else if (arg.startsWith("--clone-min-fill-usdc")) opts.cloneMinFillUsdc = Number(readValue());
     else if (arg.startsWith("--clone-min-fill-price")) opts.cloneMinFillPrice = Number(readValue());
     else if (arg.startsWith("--clone-late-entry-buffer-sec")) opts.cloneLateEntryBufferSec = Number(readValue());
@@ -261,6 +359,13 @@ function parseArgs(argv) {
     else if (arg === "--no-clone-adaptive") opts.cloneAdaptive = false;
     else if (arg.startsWith("--clone-bankroll-usdc")) opts.cloneBankrollUsdc = Number(readValue());
     else if (arg.startsWith("--clone-leg-caps")) opts.cloneLegCaps = parseCloneLegCaps(readValue());
+    else if (arg === "--clone-real-orders") opts.cloneRealOrders = true;
+    else if (arg === "--no-clone-real-orders") opts.cloneRealOrders = false;
+    else if (arg.startsWith("--clone-real-order-adapter")) opts.cloneRealOrderAdapter = String(readValue()).trim();
+    else if (arg === "--clone-real-order-require-live-gate") opts.cloneRealOrderRequireLiveGate = true;
+    else if (arg === "--clone-real-order-ignore-live-gate") opts.cloneRealOrderRequireLiveGate = false;
+    else if (arg.startsWith("--clone-real-order-max-budget-usdc")) opts.cloneRealOrderMaxBudgetUsdc = Number(readValue());
+    else if (arg.startsWith("--clone-real-order-daily-loss-limit-usdc")) opts.cloneRealOrderDailyLossLimitUsdc = Number(readValue());
     else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -325,6 +430,19 @@ function parseArgs(argv) {
   opts.cloneLiquidityParticipation = clampNum(opts.cloneLiquidityParticipation, 0.01, 1, 0.35);
   opts.cloneExecutionLatencyMs = clampInt(opts.cloneExecutionLatencyMs, 0, 10_000, 600);
   opts.cloneQueueDelaySec = clampInt(opts.cloneQueueDelaySec, 0, 60, 1);
+  opts.cloneBookStaleAfterMs = clampInt(opts.cloneBookStaleAfterMs, 250, 30000, 2500);
+  opts.cloneTakerDepthHaircut = clampNum(opts.cloneTakerDepthHaircut, 0.05, 1, 0.72);
+  opts.cloneMakerDepthHaircut = clampNum(opts.cloneMakerDepthHaircut, 0.01, 1, 0.42);
+  opts.cloneMakerQueueAheadPct = clampNum(opts.cloneMakerQueueAheadPct, 0, 0.98, 0.72);
+  opts.cloneAllowSnapshotTakerFill = Boolean(opts.cloneAllowSnapshotTakerFill);
+  opts.cloneAllowSyntheticFallbackFill = Boolean(opts.cloneAllowSyntheticFallbackFill);
+  opts.cloneUseWebSocketOrderbook = Boolean(opts.cloneUseWebSocketOrderbook);
+  opts.cloneRequireWebSocketCrossFill = Boolean(opts.cloneRequireWebSocketCrossFill);
+  opts.cloneLiveReadyMaxBookAgeMs = clampInt(opts.cloneLiveReadyMaxBookAgeMs, 250, 5000, 1000);
+  opts.cloneLiveReadyMinWindows = clampInt(opts.cloneLiveReadyMinWindows, 0, 500, 48);
+  opts.cloneLiveReadyMinFokOrders = clampInt(opts.cloneLiveReadyMinFokOrders, 0, 200, 8);
+  opts.cloneLiveReadyMinFokFillRate = clampNum(opts.cloneLiveReadyMinFokFillRate, 0, 1, 0.35);
+  opts.cloneLiveReadyMaxAdverseRate = clampNum(opts.cloneLiveReadyMaxAdverseRate, 0, 1, 0.45);
   opts.cloneMinFillUsdc = clampNum(opts.cloneMinFillUsdc, POLYMARKET_MIN_ORDER_USDC, 50, POLYMARKET_MIN_ORDER_USDC);
   opts.cloneMinFillPrice = clampNum(opts.cloneMinFillPrice, 0.01, 0.99, 0.01);
   opts.cloneLateEntryBufferSec = clampInt(opts.cloneLateEntryBufferSec, 0, 600, 4);
@@ -337,6 +455,11 @@ function parseArgs(argv) {
   opts.cloneMaxConsecutiveLosses = clampInt(opts.cloneMaxConsecutiveLosses, 0, 100, 3);
   opts.cloneBankrollUsdc = clampNum(opts.cloneBankrollUsdc, 0, 250000, 0);
   opts.cloneLegCaps = normalizeCloneLegCaps(opts.cloneLegCaps);
+  opts.cloneRealOrders = Boolean(opts.cloneRealOrders);
+  opts.cloneRealOrderAdapter = normalizeRealOrderAdapter(opts.cloneRealOrderAdapter);
+  opts.cloneRealOrderRequireLiveGate = opts.cloneRealOrderRequireLiveGate !== false;
+  opts.cloneRealOrderMaxBudgetUsdc = clampNum(opts.cloneRealOrderMaxBudgetUsdc, 0, 50, 50);
+  opts.cloneRealOrderDailyLossLimitUsdc = clampNum(opts.cloneRealOrderDailyLossLimitUsdc, 0, 50, 5);
   if (!/^0x[a-fA-F0-9]{40}$/.test(opts.wallet)) throw new Error(`Invalid wallet: ${opts.wallet}`);
   return opts;
 }
@@ -367,6 +490,13 @@ Options:
   --clone-late-entry-buffer-sec <n>  Stop entries this many seconds before window close. Default: 4
   --clone-daily-loss-limit-usdc <n>  Pause after daily paper loss. Default: 5000
   --no-clone-adaptive         Disable small adaptive parameter tuning
+  --clone-real-orders         Arm guarded real-order switch; still requires env confirmation
+  --clone-real-order-max-budget-usdc <n>  Hard real-order budget cap. Default/max: 50
+  --clone-real-order-daily-loss-limit-usdc <n>  Real-order daily loss breaker. Default: 5
+  --clone-real-order-ignore-live-gate  Do not require LiveGate readiness for switch state
+  Env confirmation for real orders:
+    BONEREAPER_REAL_ORDERS=1
+    BONEREAPER_REAL_ORDERS_CONFIRM=${REAL_ORDER_CONFIRM_VALUE}
   --reset                     Ignore an existing state.json and start fresh
 `);
 }
@@ -604,12 +734,110 @@ async function fetchJsonWithPython(python, url, opts) {
     "with urllib.request.urlopen(req, timeout=timeout) as r:",
     "    sys.stdout.buffer.write(r.read())",
   ].join("\n");
-  const { stdout } = await execFileAsync(
+  const { stdout } = await execFileStrict(
     python,
     ["-c", code, String(url), String(Math.max(1, Math.ceil(opts.timeoutMs / 1000)))],
     { maxBuffer: 64 * 1024 * 1024, timeout: opts.timeoutMs + 2500 },
   );
   return JSON.parse(stdout);
+}
+
+function execFileStrict(file, args, options = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let done = false;
+    const child = execFile(file, args, {
+      maxBuffer: options.maxBuffer,
+      windowsHide: true,
+    }, (err, stdout, stderr) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (err) {
+        err.stderr = stderr;
+        rejectPromise(err);
+        return;
+      }
+      resolvePromise({ stdout, stderr });
+    });
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Best effort; the rejected promise prevents the refresh loop from hanging.
+      }
+      rejectPromise(new Error(`python fetch timeout after ${options.timeout || 0}ms`));
+    }, Math.max(1000, num(options.timeout, 15000)));
+  });
+}
+
+function normalizeProxyUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (/^[a-z]+:\/\//i.test(text)) return text;
+  return `http://${text}`;
+}
+
+function proxyUrlFromWindowsProxy(proxyServer) {
+  const text = String(proxyServer || "").trim();
+  if (!text) return "";
+  if (!text.includes("=")) return normalizeProxyUrl(text.split(";")[0]);
+  const entries = Object.fromEntries(text
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const idx = part.indexOf("=");
+      return idx > 0 ? [part.slice(0, idx).toLowerCase(), part.slice(idx + 1)] : ["", part];
+    }));
+  return normalizeProxyUrl(entries.https || entries.http || entries.all || entries.socks || "");
+}
+
+async function windowsUserProxyUrl() {
+  if (process.platform !== "win32") return "";
+  const code = [
+    "$p=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'",
+    "if ($p.ProxyEnable -eq 1 -and $p.ProxyServer) { [Console]::Out.Write($p.ProxyServer) }",
+  ].join("; ");
+  try {
+    const { stdout } = await execFileStrict(
+      "powershell.exe",
+      ["-NoProfile", "-Command", code],
+      { maxBuffer: 1024 * 1024, timeout: 4000 },
+    );
+    return proxyUrlFromWindowsProxy(stdout);
+  } catch {
+    return "";
+  }
+}
+
+async function restartWithNodeProxyIfNeeded(opts) {
+  if (process.env.BONEREAPER_DISABLE_AUTO_PROXY === "1") return false;
+  if (process.env.BONEREAPER_PROXY_BOOTSTRAPPED === "1") return false;
+  if (opts?.cloneUseWebSocketOrderbook === false) return false;
+  const existingProxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY || "";
+  const proxyUrl = existingProxy || await windowsUserProxyUrl();
+  if (!proxyUrl) return false;
+  const env = {
+    ...process.env,
+    HTTPS_PROXY: normalizeProxyUrl(proxyUrl),
+    HTTP_PROXY: normalizeProxyUrl(proxyUrl),
+    ALL_PROXY: normalizeProxyUrl(proxyUrl),
+    NODE_USE_ENV_PROXY: "1",
+    BONEREAPER_PROXY_BOOTSTRAPPED: "1",
+  };
+  console.log(`[live] restarting with Node env proxy for WebSocket: ${env.HTTPS_PROXY}`);
+  const child = spawn(process.execPath, process.argv.slice(1), {
+    cwd: process.cwd(),
+    env,
+    stdio: "ignore",
+    windowsHide: true,
+    detached: true,
+  });
+  child.unref();
+  setTimeout(() => process.exit(0), 250);
+  return true;
 }
 
 function isRetryableFetchError(err) {
@@ -789,6 +1017,42 @@ function emptyCloneVersionCumulative(version = null) {
   };
 }
 
+function emptyShadowLiveStats() {
+  return {
+    attempts: 0,
+    wouldSubmit: 0,
+    expectedFilled: 0,
+    expectedCancelled: 0,
+    blocked: 0,
+    wsFresh: 0,
+    wsStale: 0,
+    totalNotional: 0,
+    expectedFillNotional: 0,
+    avgBookAgeMs: null,
+    maxBookAgeMs: null,
+    statuses: {},
+  };
+}
+
+function createShadowLiveState(strategyVersion = null) {
+  return {
+    enabled: true,
+    mode: "read-only",
+    submitAllowed: false,
+    realOrderSubmitAllowed: false,
+    realOrderSwitch: buildRealOrderSwitchFromConfig({}),
+    orderType: "FAK/IOC",
+    strategyVersionId: strategyVersion?.id || "",
+    strategyVersionName: strategyVersion?.name || "",
+    startedAt: null,
+    updatedAt: null,
+    nextId: 0,
+    orders: [],
+    stats: emptyShadowLiveStats(),
+    lastReceipt: null,
+  };
+}
+
 function createInitialCloneState(opts, slugOverride = null) {
   const slug = slugOverride || opts.slug || "";
   const asset = slugAsset(slug) || "BTC";
@@ -833,6 +1097,7 @@ function createInitialCloneState(opts, slugOverride = null) {
     },
     orders: [],
     fills: [],
+    shadowLive: createShadowLiveState(strategyVersion),
     positions: emptyClonePositions(),
     pnl: {
       cost: 0,
@@ -947,6 +1212,19 @@ function cloneConfig(opts) {
     liquidityParticipation: opts.cloneLiquidityParticipation,
     executionLatencyMs: opts.cloneExecutionLatencyMs,
     queueDelaySec: opts.cloneQueueDelaySec,
+    bookStaleAfterMs: opts.cloneBookStaleAfterMs,
+    takerDepthHaircut: opts.cloneTakerDepthHaircut,
+    makerDepthHaircut: opts.cloneMakerDepthHaircut,
+    makerQueueAheadPct: opts.cloneMakerQueueAheadPct,
+    allowSnapshotTakerFill: opts.cloneAllowSnapshotTakerFill,
+    allowSyntheticFallbackFill: opts.cloneAllowSyntheticFallbackFill,
+    useWebSocketOrderbook: opts.cloneUseWebSocketOrderbook,
+    requireWebSocketCrossFill: opts.cloneRequireWebSocketCrossFill,
+    liveReadyMaxBookAgeMs: opts.cloneLiveReadyMaxBookAgeMs,
+    liveReadyMinWindows: opts.cloneLiveReadyMinWindows,
+    liveReadyMinFokOrders: opts.cloneLiveReadyMinFokOrders,
+    liveReadyMinFokFillRate: opts.cloneLiveReadyMinFokFillRate,
+    liveReadyMaxAdverseRate: opts.cloneLiveReadyMaxAdverseRate,
     minFillUsdc: opts.cloneMinFillUsdc,
     minFillPrice: opts.cloneMinFillPrice,
     lateEntryBufferSec: opts.cloneLateEntryBufferSec,
@@ -957,8 +1235,40 @@ function cloneConfig(opts) {
     dailyLossLimitUsdc: opts.cloneDailyLossLimitUsdc,
     maxDirectionExposureUsdc: opts.cloneMaxDirectionExposureUsdc,
     maxConsecutiveLosses: opts.cloneMaxConsecutiveLosses,
+    realOrderRequested: Boolean(opts.cloneRealOrders),
+    realOrderEnvEnabled: envFlag("BONEREAPER_REAL_ORDERS"),
+    realOrderConfirmOk: String(process.env.BONEREAPER_REAL_ORDERS_CONFIRM || "").trim() === REAL_ORDER_CONFIRM_VALUE,
+    realOrderAdapter: normalizeRealOrderAdapter(opts.cloneRealOrderAdapter),
+    realOrderRequireLiveGate: opts.cloneRealOrderRequireLiveGate !== false,
+    realOrderMaxBudgetUsdc: opts.cloneRealOrderMaxBudgetUsdc,
+    realOrderDailyLossLimitUsdc: opts.cloneRealOrderDailyLossLimitUsdc,
     adaptive: Boolean(opts.cloneAdaptive),
     targetOrderRows: 0,
+    spreadMakerChildrenAcrossLevels: true,
+    flowTouchScoutEnabled: false,
+    flowTouchScoutOrderUsdc: POLYMARKET_MIN_ORDER_USDC,
+    flowTouchScoutMaxPerCycle: 0,
+    flowTouchScoutMaxEdgeDebt: 0.16,
+    tailRiskScoutEnabled: false,
+    tailRiskScoutOrderUsdc: POLYMARKET_MIN_ORDER_USDC,
+    tailRiskScoutMaxPerCycle: 0,
+    tailRiskScoutMaxAsk: 0.06,
+    tailRiskScoutCrossMaxAsk: 0.03,
+    tailRiskScoutFokMode: true,
+    tailRiskScoutFokFillGraceMs: 900,
+    tailRiskScoutFokBookStaleAfterMs: 1200,
+    parentSafetyScoutEnabled: false,
+    parentSafetyScoutOrderUsdc: POLYMARKET_MIN_ORDER_USDC,
+    parentSafetyScoutMaxPerCycle: 0,
+    parentSafetyScoutMaxAsk: 0.88,
+    parentSafetyScoutMaxLocalOpposeBps: 8,
+    parentSafetyScoutMaxEdgeDebt: 0.08,
+    confidenceCrossScoutEnabled: false,
+    confidenceCrossScoutOrderUsdc: POLYMARKET_MIN_ORDER_USDC,
+    confidenceCrossScoutMaxPerCycle: 0,
+    confidenceCrossScoutMinSignalBps: 10,
+    confidenceCrossScoutMaxAsk: 0.92,
+    confidenceCrossScoutMaxEdgeDebt: 0.05,
   };
 }
 
@@ -1013,6 +1323,30 @@ function attachCloneVersion(clone, version) {
   clone.strategyVersionId = version.id;
   clone.strategyVersionName = version.name;
   clone.versionStartedAt = version.startedAt;
+  ensureShadowLiveState(clone, version);
+}
+
+function ensureShadowLiveState(clone, version = null) {
+  if (!clone || typeof clone !== "object") return;
+  const strategyVersion = version || {
+    id: clone.strategyVersionId || "",
+    name: clone.strategyVersionName || "",
+    startedAt: clone.versionStartedAt || null,
+  };
+  const realOrderSwitch = clone.config?.realOrderSwitch || buildRealOrderSwitchFromConfig(clone.config || {});
+  if (!clone.shadowLive || typeof clone.shadowLive !== "object") clone.shadowLive = createShadowLiveState(strategyVersion);
+  clone.shadowLive.enabled = true;
+  clone.shadowLive.mode = realOrderSwitch.mode || "read-only";
+  clone.shadowLive.submitAllowed = Boolean(realOrderSwitch.submitAllowed);
+  clone.shadowLive.realOrderSubmitAllowed = Boolean(realOrderSwitch.realOrderSubmitAllowed);
+  clone.shadowLive.realOrderSwitch = realOrderSwitch;
+  clone.shadowLive.orderType = clone.shadowLive.orderType || "FAK/IOC";
+  clone.shadowLive.strategyVersionId = strategyVersion?.id || clone.strategyVersionId || "";
+  clone.shadowLive.strategyVersionName = strategyVersion?.name || clone.strategyVersionName || "";
+  clone.shadowLive.startedAt ||= strategyVersion?.startedAt || clone.versionStartedAt || null;
+  if (!Array.isArray(clone.shadowLive.orders)) clone.shadowLive.orders = [];
+  clone.shadowLive.nextId = Math.max(num(clone.shadowLive.nextId, 0), ...clone.shadowLive.orders.map((row) => num(String(row?.id || "").replace(/^shadow-/, ""), 0)));
+  clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
 }
 
 function normalizeStrategyVersionNames(state, strategyVersion) {
@@ -1570,6 +1904,348 @@ function normalizeBookLevels(levels, reverse = false) {
   return normalized.slice(0, 12);
 }
 
+function marketWsEnabled(opts = {}) {
+  return opts.cloneUseWebSocketOrderbook !== false && typeof WebSocket === "function";
+}
+
+function marketWsAssetIds(market) {
+  return OUTCOMES
+    .map((outcome) => String(market?.outcomeTokenIds?.[outcome] || ""))
+    .filter(Boolean);
+}
+
+function marketWsTimestampMs(value, fallback = Date.now()) {
+  const ts = finiteNum(value, NaN);
+  if (!Number.isFinite(ts) || ts <= 0) return fallback;
+  return ts > 1_000_000_000_000 ? ts : ts * 1000;
+}
+
+function marketWsStatusSnapshot() {
+  return {
+    enabled: typeof WebSocket === "function",
+    status: marketWsOrderbook.status,
+    wantedAssets: marketWsOrderbook.wantedAssetIds.size,
+    subscribedAssets: marketWsOrderbook.subscribedAssetIds.size,
+    cachedBooks: marketWsOrderbook.books.size,
+    lastOpenAt: marketWsOrderbook.lastOpenAt,
+    lastMessageAt: marketWsOrderbook.lastMessageAt,
+    lastError: marketWsOrderbook.lastError,
+    messages: marketWsOrderbook.messages,
+    proxy: process.env.NODE_USE_ENV_PROXY === "1"
+      ? String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY || "")
+      : "",
+  };
+}
+
+function marketWsSend(payload) {
+  const ws = marketWsOrderbook.socket;
+  if (!ws || ws.readyState !== 1) return false;
+  ws.send(typeof payload === "string" ? payload : JSON.stringify(payload));
+  return true;
+}
+
+function marketWsSubscribe(assetIds, operation = "") {
+  const ids = [...new Set((assetIds || []).map(String).filter(Boolean))];
+  if (!ids.length) return false;
+  const payload = operation
+    ? { assets_ids: ids, operation, custom_feature_enabled: true }
+    : { assets_ids: ids, type: "market", custom_feature_enabled: true };
+  if (!marketWsSend(payload)) return false;
+  for (const id of ids) marketWsOrderbook.subscribedAssetIds.add(id);
+  return true;
+}
+
+function marketWsScheduleReconnect() {
+  if (marketWsOrderbook.reconnectTimer || !marketWsOrderbook.wantedAssetIds.size) return;
+  const delayMs = Math.min(15000, 1500 + marketWsOrderbook.reconnectAttempt * 1500);
+  marketWsOrderbook.reconnectTimer = setTimeout(() => {
+    marketWsOrderbook.reconnectTimer = null;
+    marketWsConnect();
+  }, delayMs);
+}
+
+function marketWsConnect() {
+  if (typeof WebSocket !== "function") {
+    marketWsOrderbook.status = "unsupported";
+    marketWsOrderbook.lastError = "native WebSocket unavailable";
+    return;
+  }
+  const current = marketWsOrderbook.socket;
+  if (current && (current.readyState === 0 || current.readyState === 1)) return;
+  marketWsOrderbook.status = "connecting";
+  const ws = new WebSocket(CLOB_WS_MARKET_URL);
+  marketWsOrderbook.socket = ws;
+  clearTimeout(marketWsOrderbook.openTimer);
+  marketWsOrderbook.openTimer = setTimeout(() => {
+    if (marketWsOrderbook.socket === ws && ws.readyState === 0) {
+      marketWsOrderbook.lastError = "websocket open timeout";
+      try {
+        ws.close();
+      } catch {
+        // Reconnect scheduling is handled by the close event.
+      }
+    }
+  }, 8000);
+  ws.addEventListener("open", () => {
+    clearTimeout(marketWsOrderbook.openTimer);
+    marketWsOrderbook.openTimer = null;
+    marketWsOrderbook.status = "open";
+    marketWsOrderbook.lastOpenAt = new Date().toISOString();
+    marketWsOrderbook.lastError = "";
+    marketWsOrderbook.reconnectAttempt = 0;
+    marketWsOrderbook.subscribedAssetIds.clear();
+    marketWsSubscribe([...marketWsOrderbook.wantedAssetIds]);
+    clearInterval(marketWsOrderbook.pingTimer);
+    marketWsOrderbook.pingTimer = setInterval(() => {
+      try {
+        marketWsSend("PING");
+      } catch (err) {
+        marketWsOrderbook.lastError = shortError(err);
+      }
+    }, 10_000);
+  });
+  ws.addEventListener("message", (event) => {
+    handleMarketWsMessage(event?.data);
+  });
+  ws.addEventListener("error", (event) => {
+    clearTimeout(marketWsOrderbook.openTimer);
+    marketWsOrderbook.openTimer = null;
+    marketWsOrderbook.status = "error";
+    marketWsOrderbook.lastError = shortError(event?.error || event?.message || "websocket error");
+  });
+  ws.addEventListener("close", () => {
+    clearTimeout(marketWsOrderbook.openTimer);
+    marketWsOrderbook.openTimer = null;
+    clearInterval(marketWsOrderbook.pingTimer);
+    marketWsOrderbook.pingTimer = null;
+    marketWsOrderbook.socket = null;
+    marketWsOrderbook.subscribedAssetIds.clear();
+    marketWsOrderbook.status = "closed";
+    marketWsOrderbook.reconnectAttempt += 1;
+    marketWsScheduleReconnect();
+  });
+}
+
+function ensureMarketWsSubscription(market, opts = {}) {
+  if (!marketWsEnabled(opts)) return;
+  const ids = marketWsAssetIds(market);
+  if (!ids.length) return;
+  const newIds = ids.filter((id) => !marketWsOrderbook.wantedAssetIds.has(id));
+  for (const id of ids) marketWsOrderbook.wantedAssetIds.add(id);
+  marketWsConnect();
+  if (newIds.length && marketWsOrderbook.socket?.readyState === 1) {
+    marketWsSubscribe(newIds, "subscribe");
+  }
+}
+
+function handleMarketWsMessage(data) {
+  if (data == null) return;
+  const text = typeof data === "string" ? data : String(data);
+  if (!text || text === "PONG" || text === "PING") return;
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return;
+  }
+  const messages = Array.isArray(payload) ? payload : [payload];
+  for (const message of messages) updateMarketWsBook(message);
+}
+
+function ensureMarketWsBook(assetId) {
+  const id = String(assetId || "");
+  if (!id) return null;
+  let book = marketWsOrderbook.books.get(id);
+  if (!book) {
+    book = {
+      tokenId: id,
+      bids: [],
+      asks: [],
+      bestBid: null,
+      bestAsk: null,
+      tickSize: null,
+      market: "",
+      lastTrade: null,
+      exchangeTimestampMs: null,
+      receivedAtMs: 0,
+      hash: "",
+      bootstrap: false,
+    };
+    marketWsOrderbook.books.set(id, book);
+  }
+  return book;
+}
+
+function upsertBookLevel(levels, price, size, reverse = false) {
+  const p = finiteNum(price, NaN);
+  const s = finiteNum(size, NaN);
+  if (!Number.isFinite(p) || p <= 0) return levels;
+  const next = (Array.isArray(levels) ? levels : []).filter((level) => Math.abs(num(level.price) - p) > 0.0000005);
+  if (Number.isFinite(s) && s > 0) next.push({ price: round(p, 6), size: round(s, 6) });
+  next.sort((a, b) => reverse ? b.price - a.price : a.price - b.price);
+  return next.slice(0, 12);
+}
+
+function updateMarketWsBook(message) {
+  const eventType = String(message?.event_type || "").toLowerCase();
+  const nowMs = Date.now();
+  marketWsOrderbook.messages += 1;
+  marketWsOrderbook.lastMessageAt = new Date(nowMs).toISOString();
+  if (eventType === "book") {
+    const book = ensureMarketWsBook(message.asset_id);
+    if (!book) return;
+    book.market = message.market || book.market;
+    book.bids = normalizeBookLevels(message.bids, true);
+    book.asks = normalizeBookLevels(message.asks, false);
+    book.bestBid = finiteNum(book.bids[0]?.price, finiteNum(message.best_bid, null));
+    book.bestAsk = finiteNum(book.asks[0]?.price, finiteNum(message.best_ask, null));
+    book.tickSize = finiteNum(message.tick_size, book.tickSize);
+    book.exchangeTimestampMs = marketWsTimestampMs(message.timestamp, nowMs);
+    book.receivedAtMs = nowMs;
+    book.hash = message.hash || book.hash;
+    book.bootstrap = false;
+    return;
+  }
+  if (eventType === "price_change") {
+    const changes = Array.isArray(message.price_changes) ? message.price_changes : [];
+    for (const change of changes) {
+      const book = ensureMarketWsBook(change.asset_id);
+      if (!book) continue;
+      const side = String(change.side || "").toUpperCase();
+      if (side === "BUY") book.bids = upsertBookLevel(book.bids, change.price, change.size, true);
+      else if (side === "SELL") book.asks = upsertBookLevel(book.asks, change.price, change.size, false);
+      book.bestBid = finiteNum(change.best_bid, finiteNum(book.bids[0]?.price, book.bestBid));
+      book.bestAsk = finiteNum(change.best_ask, finiteNum(book.asks[0]?.price, book.bestAsk));
+      book.market = message.market || book.market;
+      book.exchangeTimestampMs = marketWsTimestampMs(message.timestamp, nowMs);
+      book.receivedAtMs = nowMs;
+      book.hash = change.hash || book.hash;
+      book.bootstrap = false;
+    }
+    return;
+  }
+  if (eventType === "best_bid_ask") {
+    const book = ensureMarketWsBook(message.asset_id);
+    if (!book) return;
+    book.bestBid = finiteNum(message.best_bid, book.bestBid);
+    book.bestAsk = finiteNum(message.best_ask, book.bestAsk);
+    book.market = message.market || book.market;
+    book.exchangeTimestampMs = marketWsTimestampMs(message.timestamp, nowMs);
+    book.receivedAtMs = nowMs;
+    book.bootstrap = false;
+    return;
+  }
+  if (eventType === "tick_size_change") {
+    const book = ensureMarketWsBook(message.asset_id);
+    if (!book) return;
+    book.tickSize = finiteNum(message.new_tick_size, book.tickSize);
+    book.exchangeTimestampMs = marketWsTimestampMs(message.timestamp, nowMs);
+    book.receivedAtMs = nowMs;
+    book.bootstrap = false;
+    return;
+  }
+  if (eventType === "last_trade_price") {
+    const book = ensureMarketWsBook(message.asset_id);
+    if (!book) return;
+    book.lastTrade = {
+      price: finiteNum(message.price, null),
+      size: finiteNum(message.size, null),
+      side: message.side || "",
+      timestampMs: marketWsTimestampMs(message.timestamp, nowMs),
+    };
+    book.market = message.market || book.market;
+    book.exchangeTimestampMs = book.lastTrade.timestampMs;
+    book.receivedAtMs = nowMs;
+    book.bootstrap = false;
+  }
+}
+
+function seedMarketWsBookFromRest(tokenId, quote, market) {
+  if (marketWsOrderbook.status !== "open") return false;
+  const book = ensureMarketWsBook(tokenId);
+  if (!book) return false;
+  if (book.receivedAtMs && Date.now() - book.receivedAtMs <= num(market?.bookStaleAfterMs, 2500)) return false;
+  book.market = market?.conditionId || market?.slug || book.market;
+  book.bids = normalizeBookLevels(quote?.bids, true);
+  book.asks = normalizeBookLevels(quote?.asks, false);
+  book.bestBid = finiteNum(book.bids[0]?.price, finiteNum(quote?.bid, book.bestBid));
+  book.bestAsk = finiteNum(book.asks[0]?.price, finiteNum(quote?.ask, book.bestAsk));
+  book.tickSize = finiteNum(quote?.tickSize, book.tickSize);
+  book.exchangeTimestampMs = null;
+  book.receivedAtMs = Date.now();
+  book.hash = "";
+  book.bootstrap = true;
+  return true;
+}
+
+function seedMarketWsBooksFromRest(market, restOrderbook) {
+  let seeded = 0;
+  for (const outcome of OUTCOMES) {
+    const tokenId = market?.outcomeTokenIds?.[outcome];
+    const quote = restOrderbook?.[outcome];
+    if (tokenId && quote && seedMarketWsBookFromRest(tokenId, quote, market)) seeded += 1;
+  }
+  return seeded;
+}
+
+function quoteFromMarketWsBook(tokenId, opts = {}) {
+  const book = marketWsOrderbook.books.get(String(tokenId || ""));
+  if (!book || !book.receivedAtMs) return null;
+  const ageMs = Math.max(0, Date.now() - book.receivedAtMs);
+  const maxAgeMs = Math.max(num(opts.cloneBookStaleAfterMs, 2500), num(opts.cloneLiveReadyMaxBookAgeMs, 1000));
+  if (ageMs > Math.max(250, maxAgeMs)) return null;
+  const bids = Array.isArray(book.bids) ? book.bids.slice(0, 12) : [];
+  const asks = Array.isArray(book.asks) ? book.asks.slice(0, 12) : [];
+  const bid = finiteNum(bids[0]?.price, finiteNum(book.bestBid, null));
+  const ask = finiteNum(asks[0]?.price, finiteNum(book.bestAsk, null));
+  return {
+    source: book.bootstrap ? "clob-websocket-bootstrap" : "clob-websocket",
+    transport: "websocket",
+    tokenId: String(tokenId),
+    bid,
+    ask,
+    mid: Number.isFinite(bid) && Number.isFinite(ask) ? round((bid + ask) / 2, 6) : null,
+    spread: Number.isFinite(bid) && Number.isFinite(ask) ? round(ask - bid, 6) : null,
+    takerFeeRate: null,
+    makerFeeRate: 0,
+    minOrderSize: POLYMARKET_MIN_ORDER_SHARES,
+    tickSize: finiteNum(book.tickSize, null),
+    bids,
+    asks,
+    updatedAt: new Date(book.receivedAtMs).toISOString(),
+    exchangeTimestampMs: book.exchangeTimestampMs,
+    bookAgeMs: Math.round(ageMs),
+    lastTrade: book.lastTrade,
+    hash: book.hash || "",
+  };
+}
+
+function composeOrderBooks(quotes, source, extra = {}) {
+  return {
+    source,
+    transport: source.includes("websocket") ? "websocket" : "rest",
+    updatedAt: new Date().toISOString(),
+    ws: marketWsStatusSnapshot(),
+    Up: quotes.Up,
+    Down: quotes.Down,
+    comboAsk: Number.isFinite(quotes.Up?.ask) && Number.isFinite(quotes.Down?.ask) ? round(quotes.Up.ask + quotes.Down.ask, 6) : null,
+    comboBid: Number.isFinite(quotes.Up?.bid) && Number.isFinite(quotes.Down?.bid) ? round(quotes.Up.bid + quotes.Down.bid, 6) : null,
+    ...extra,
+  };
+}
+
+function marketWsQuotesForMarket(market, opts = {}) {
+  if (!marketWsEnabled(opts)) return null;
+  ensureMarketWsSubscription(market, opts);
+  const quotes = {};
+  for (const outcome of OUTCOMES) {
+    const tokenId = market?.outcomeTokenIds?.[outcome];
+    if (!tokenId) return null;
+    quotes[outcome] = quoteFromMarketWsBook(tokenId, opts);
+  }
+  return quotes;
+}
+
 async function fetchOrderBook(tokenId, opts) {
   const payload = await fetchJson(buildUrl(CLOB_API_URL, "/book", { token_id: tokenId }), opts);
   const feeRate = await fetchTokenFeeRate(tokenId, opts);
@@ -1657,18 +2333,46 @@ function fallbackQuoteFromGamma(market, outcome) {
 }
 
 async function fetchOrderBooks(market, opts) {
+  const wsQuotes = marketWsQuotesForMarket(market, opts);
+  const completeWs = Boolean(wsQuotes && OUTCOMES.every((outcome) => (
+    wsQuotes[outcome]
+    && (Number.isFinite(wsQuotes[outcome].ask) || Number.isFinite(wsQuotes[outcome].bid))
+  )));
+  if (completeWs) {
+    const source = OUTCOMES.some((outcome) => String(wsQuotes[outcome]?.source || "").includes("bootstrap"))
+      ? "clob-websocket-bootstrap"
+      : "clob-websocket";
+    return composeOrderBooks(wsQuotes, source);
+  }
+  const rest = await fetchOrderBooksRest(market, opts);
+  const seeded = marketWsEnabled(opts) ? seedMarketWsBooksFromRest(market, rest) : 0;
+  const activeWsQuotes = seeded ? marketWsQuotesForMarket(market, opts) : wsQuotes;
+  if (!activeWsQuotes) return rest;
+  let wsUsed = 0;
+  const quotes = { Up: rest.Up, Down: rest.Down };
+  for (const outcome of OUTCOMES) {
+    if (activeWsQuotes[outcome] && (Number.isFinite(activeWsQuotes[outcome].ask) || Number.isFinite(activeWsQuotes[outcome].bid))) {
+      quotes[outcome] = activeWsQuotes[outcome];
+      wsUsed += 1;
+    }
+  }
+  if (!wsUsed) return { ...rest, ws: marketWsStatusSnapshot() };
+  const wsSource = OUTCOMES.some((outcome) => String(quotes[outcome]?.source || "").includes("bootstrap"))
+    ? "clob-websocket-bootstrap"
+    : "clob-websocket";
+  return composeOrderBooks(quotes, wsUsed === OUTCOMES.length ? wsSource : `mixed ${wsSource}/${rest.source || "rest"}`, {
+    restSource: rest.source || "",
+    wsOutcomes: wsUsed,
+    wsBootstrapSeeded: seeded,
+  });
+}
+
+async function fetchOrderBooksRest(market, opts) {
   const quotes = {};
   const errors = [];
   if (market?.closed || market?.acceptingOrders === false) {
     for (const outcome of OUTCOMES) quotes[outcome] = fallbackQuoteFromGamma(market, outcome);
-    return {
-      source: "gamma-price-fallback-closed",
-      updatedAt: new Date().toISOString(),
-      Up: quotes.Up,
-      Down: quotes.Down,
-      comboAsk: Number.isFinite(quotes.Up?.ask) && Number.isFinite(quotes.Down?.ask) ? round(quotes.Up.ask + quotes.Down.ask, 6) : null,
-      comboBid: Number.isFinite(quotes.Up?.bid) && Number.isFinite(quotes.Down?.bid) ? round(quotes.Up.bid + quotes.Down.bid, 6) : null,
-    };
+    return composeOrderBooks(quotes, "gamma-price-fallback-closed");
   }
   await Promise.all(OUTCOMES.map(async (outcome) => {
     const tokenId = market?.outcomeTokenIds?.[outcome];
@@ -1690,10 +2394,7 @@ async function fetchOrderBooks(market, opts) {
     ? round(quotes.Up.bid + quotes.Down.bid, 6)
     : null;
   return {
-    source: errors.length ? `fallback (${errors.join("; ")})` : "clob",
-    updatedAt: new Date().toISOString(),
-    Up: quotes.Up,
-    Down: quotes.Down,
+    ...composeOrderBooks(quotes, errors.length ? `fallback (${errors.join("; ")})` : "clob-rest"),
     comboAsk,
     comboBid,
   };
@@ -1778,6 +2479,7 @@ async function refreshOneCloneEngine(state, clone, opts, nowSec) {
     }
     evaluateCloneRisk(state, clone);
     generateCloneOrders(clone, nowSec);
+    fillOpenCloneOrders(clone, nowSec);
     updateClonePnl(state, clone);
     updateCloneAdverseSelection(clone, nowSec);
     evaluateCloneRisk(state, clone);
@@ -2042,8 +2744,35 @@ function minCloneOrderNotional(clone, outcome, effectivePrice) {
 
 function dynamicCloneNotional(clone, candidate, limitPrice, elapsed, minNotional = POLYMARKET_MIN_ORDER_USDC) {
   const cfg = clone.config || {};
-  const probeLike = candidate.kind === "probe" || candidate.kind === "learned-probe";
-  const base = probeLike ? num(cfg.probeOrderUsdc, 1) : num(cfg.orderUsdc, 1);
+  const learningScoutLike = candidate.kind === "live-learning-scout";
+  const flowTouchScoutLike = candidate.kind === "flow-touch-scout";
+  const fifteenMinuteTouchScoutLike = candidate.kind === "fifteen-minute-touch-scout";
+  const tailRiskScoutLike = candidate.kind === "tail-risk-scout";
+  const bilateralInventoryScoutLike = candidate.kind === "bilateral-inventory-scout";
+  const windowParticipationScoutLike = candidate.kind === "window-participation-scout";
+  const parentSafetyScoutLike = candidate.kind === "parent-safety-scout";
+  const confidenceCrossScoutLike = candidate.kind === "confidence-cross-scout";
+  const scoutLike = candidate.kind === "quality-scout" || learningScoutLike || flowTouchScoutLike || fifteenMinuteTouchScoutLike || tailRiskScoutLike || bilateralInventoryScoutLike || windowParticipationScoutLike || parentSafetyScoutLike || confidenceCrossScoutLike;
+  const probeLike = candidate.kind === "probe" || candidate.kind === "learned-probe" || scoutLike;
+  const base = learningScoutLike
+    ? num(cfg.liveLearningScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : flowTouchScoutLike
+    ? num(cfg.flowTouchScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : fifteenMinuteTouchScoutLike
+    ? num(cfg.fifteenMinuteTouchScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : tailRiskScoutLike
+    ? num(cfg.tailRiskScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : bilateralInventoryScoutLike
+    ? num(cfg.bilateralInventoryScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : windowParticipationScoutLike
+    ? num(cfg.windowParticipationScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : parentSafetyScoutLike
+    ? num(cfg.parentSafetyScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : confidenceCrossScoutLike
+    ? num(cfg.confidenceCrossScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC)
+    : scoutLike
+    ? num(cfg.qualityScoutOrderUsdc, num(cfg.probeOrderUsdc, POLYMARKET_MIN_ORDER_USDC))
+    : probeLike ? num(cfg.probeOrderUsdc, 1) : num(cfg.orderUsdc, 1);
   const signalAbs = Math.abs(num(candidate.signalBps));
   const confidence = clamp((signalAbs - num(cfg.minSignalBps)) / Math.max(0.1, num(cfg.highConfidenceBps) - num(cfg.minSignalBps)), 0, 1);
   const whale = clamp((signalAbs - num(cfg.highConfidenceBps)) / Math.max(0.1, num(cfg.whaleConfidenceBps) - num(cfg.highConfidenceBps)), 0, 1);
@@ -2071,7 +2800,52 @@ function dynamicCloneNotional(clone, candidate, limitPrice, elapsed, minNotional
   const childDecay = num(candidate.childIndex) > 0 ? 0.82 : 1;
   const raw = base * edgeFactor * confidenceFactor * flowFactor * observedSizeFactor * inventoryFactor * hedgeFactor * flowCarryFactor * ladderFactor * timeFactor * pnlFactor * microFillFactor * childDecay;
   const minClip = Math.max(POLYMARKET_MIN_ORDER_USDC, num(minNotional, POLYMARKET_MIN_ORDER_USDC));
-  const maxClip = candidate.kind === "probe"
+  const maxClip = learningScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.liveLearningScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : flowTouchScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.flowTouchScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : tailRiskScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.tailRiskScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : bilateralInventoryScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.bilateralInventoryScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : windowParticipationScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.windowParticipationScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : fifteenMinuteTouchScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.fifteenMinuteTouchScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : parentSafetyScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.parentSafetyScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : confidenceCrossScoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.confidenceCrossScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : scoutLike
+    ? Math.min(
+      num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC),
+      Math.max(num(cfg.qualityScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC), minClip),
+    )
+    : candidate.kind === "probe"
     ? Math.min(num(cfg.maxClipUsdc, 2.5), Math.max(num(cfg.probeOrderUsdc, 1) * 2, minClip))
     : Math.max(num(cfg.maxClipUsdc, 2.5), minClip);
   return ceilMoney(clamp(raw, minClip, maxClip), 2);
@@ -2170,6 +2944,273 @@ function visibleAskDepthUsdc(quote, limitPrice) {
     .reduce((total, level) => total + num(level.price) * num(level.size), 0), 6);
 }
 
+function quoteTransport(quote, orderbook = null) {
+  const text = `${quote?.transport || ""} ${quote?.source || ""} ${orderbook?.transport || ""} ${orderbook?.source || ""}`.toLowerCase();
+  if (text.includes("websocket")) return "websocket";
+  if (text.includes("rest") || text.includes("clob")) return "rest";
+  if (text.includes("fallback")) return "fallback";
+  return "";
+}
+
+function quoteAgeMs(quote, orderbook = null, nowMs = Date.now()) {
+  if (Number.isFinite(num(quote?.bookAgeMs, NaN))) return Math.max(0, num(quote.bookAgeMs));
+  const updatedMs = Date.parse(quote?.updatedAt || orderbook?.updatedAt || "");
+  return Number.isFinite(updatedMs) ? Math.max(0, nowMs - updatedMs) : Infinity;
+}
+
+function webSocketQuoteFresh(orderbook, quote, cfg = {}) {
+  if (quoteTransport(quote, orderbook) !== "websocket") return false;
+  return quoteAgeMs(quote, orderbook) <= num(cfg.liveReadyMaxBookAgeMs, 1000);
+}
+
+function cloneOrderbookFreshness(clone, cfg = {}) {
+  const orderbook = clone?.orderbook || {};
+  const rows = OUTCOMES.map((outcome) => {
+    const quote = orderbook?.[outcome];
+    const ageMs = quoteAgeMs(quote, orderbook);
+    return {
+      outcome,
+      transport: quoteTransport(quote, orderbook),
+      ageMs: Number.isFinite(ageMs) ? Math.round(ageMs) : null,
+      websocketFresh: webSocketQuoteFresh(orderbook, quote, cfg),
+      ask: Number.isFinite(quote?.ask) ? round(quote.ask, 6) : null,
+      bid: Number.isFinite(quote?.bid) ? round(quote.bid, 6) : null,
+    };
+  });
+  const finiteAges = rows.map((row) => row.ageMs).filter((value) => Number.isFinite(value));
+  return {
+    source: orderbook.source || "",
+    transport: orderbook.transport || "",
+    maxAgeMs: finiteAges.length ? Math.max(...finiteAges) : null,
+    websocketFreshOutcomes: rows.filter((row) => row.websocketFresh).length,
+    allOutcomesWebSocketFresh: rows.length > 0 && rows.every((row) => row.websocketFresh),
+    rows,
+    ws: orderbook.ws || marketWsStatusSnapshot(),
+  };
+}
+
+function shadowLiveStats(orders = []) {
+  const rows = Array.isArray(orders) ? orders : [];
+  const stats = emptyShadowLiveStats();
+  let bookAgeTotal = 0;
+  let bookAgeCount = 0;
+  for (const row of rows) {
+    const status = String(row?.status || "UNKNOWN");
+    stats.attempts += 1;
+    stats.statuses[status] = (stats.statuses[status] || 0) + 1;
+    if (row?.submitIntent) stats.wouldSubmit += 1;
+    if (status === "WOULD_SUBMIT_FILL" || status === "PAPER_FILLED") stats.expectedFilled += 1;
+    if (status.includes("CANCEL")) stats.expectedCancelled += 1;
+    if (status.startsWith("NO_SUBMIT") || status.startsWith("BLOCKED")) stats.blocked += 1;
+    if (row?.websocketFresh) stats.wsFresh += 1;
+    else stats.wsStale += 1;
+    stats.totalNotional += num(row?.notional);
+    stats.expectedFillNotional += num(row?.expectedFillCost);
+    const ageMs = num(row?.bookAgeMs, NaN);
+    if (Number.isFinite(ageMs)) {
+      bookAgeTotal += ageMs;
+      bookAgeCount += 1;
+      stats.maxBookAgeMs = stats.maxBookAgeMs == null ? Math.round(ageMs) : Math.max(stats.maxBookAgeMs, Math.round(ageMs));
+    }
+  }
+  stats.totalNotional = round(stats.totalNotional, 6);
+  stats.expectedFillNotional = round(stats.expectedFillNotional, 6);
+  stats.avgBookAgeMs = bookAgeCount ? round(bookAgeTotal / bookAgeCount, 1) : null;
+  return stats;
+}
+
+function shadowLiveLevels(quote, limitPrice, maxLevels = 10) {
+  return visibleAskLevelsAtOrBelow(quote, limitPrice)
+    .slice(0, maxLevels)
+    .map((level) => ({
+      price: round(level.price, 6),
+      size: round(level.size, 6),
+      usdc: round(level.price * level.size, 6),
+    }));
+}
+
+function shadowLivePreflight(clone, candidate, options = {}) {
+  const cfg = clone.config || {};
+  const quote = options.quote || clone.orderbook?.[candidate?.outcome];
+  const limitPrice = num(options.limitPrice, num(candidate?.limitPrice, NaN));
+  const notional = num(options.notional, 0);
+  const feeRate = Number.isFinite(num(candidate?.feeRate, NaN))
+    ? num(candidate.feeRate)
+    : feeRateForOrder(clone, candidate?.outcome, "cross");
+  const ask = finiteNum(quote?.ask);
+  const bid = finiteNum(quote?.bid);
+  const bookAgeMs = quoteAgeMs(quote, clone.orderbook);
+  const websocketFresh = webSocketQuoteFresh(clone.orderbook, quote, cfg);
+  const transport = quoteTransport(quote, clone.orderbook);
+  const visibleDepth = visibleAskDepthUsdc(quote, limitPrice);
+  const depthHaircut = num(cfg.takerDepthHaircut, 0.72);
+  const minOrderUsdc = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minFillUsdc, POLYMARKET_MIN_ORDER_USDC));
+  const requiredDepth = round(Math.max(minOrderUsdc, notional) / Math.max(0.000001, depthHaircut), 6);
+  const levels = shadowLiveLevels(quote, limitPrice);
+  const currentAskMarketable = Number.isFinite(ask) && Number.isFinite(limitPrice) && ask > 0 && ask <= limitPrice;
+  const depthSufficient = visibleDepth + 0.000001 >= requiredDepth;
+  const freshEnough = cfg.requireWebSocketCrossFill === false || websocketFresh;
+  const notionalOk = notional + 0.000001 >= minOrderUsdc;
+  let status = "WOULD_SUBMIT_FILL";
+  let receipt = "read-only FAK/IOC would fill immediately";
+  if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
+    status = "NO_SUBMIT_BAD_LIMIT";
+    receipt = "read-only no-submit: invalid limit";
+  } else if (!notionalOk) {
+    status = "NO_SUBMIT_MIN_NOTIONAL";
+    receipt = "read-only no-submit: below minimum notional";
+  } else if (!freshEnough) {
+    status = "NO_SUBMIT_WS_STALE";
+    receipt = "read-only no-submit: WebSocket book is not fresh";
+  } else if (!currentAskMarketable) {
+    status = "NO_SUBMIT_LIMIT_NOT_MARKETABLE";
+    receipt = "read-only no-submit: current ask is above limit";
+  } else if (!depthSufficient) {
+    status = "NO_SUBMIT_INSUFFICIENT_DEPTH";
+    receipt = "read-only no-submit: visible ask depth is below full FAK/IOC requirement";
+  }
+
+  let expectedShares = 0;
+  let expectedTradeCost = 0;
+  let expectedFee = 0;
+  if (status === "WOULD_SUBMIT_FILL") {
+    const targetShares = notional / Math.max(0.000001, effectiveBuyPrice(ask, feeRate));
+    for (const level of visibleAskLevelsAtOrBelow(quote, limitPrice)) {
+      if (expectedShares >= targetShares) break;
+      const available = level.size * depthHaircut;
+      const shares = Math.min(targetShares - expectedShares, available);
+      if (shares <= 0) continue;
+      expectedShares += shares;
+      expectedTradeCost += shares * level.price;
+      expectedFee += shares * feePerShare(level.price, feeRate);
+    }
+  }
+  const expectedFillCost = round(expectedTradeCost + expectedFee, 6);
+  const submitIntent = status === "WOULD_SUBMIT_FILL";
+  return {
+    status,
+    receipt,
+    submitIntent,
+    orderType: "FAK/IOC",
+    readOnly: true,
+    ask: Number.isFinite(ask) ? round(ask, 6) : null,
+    bid: Number.isFinite(bid) ? round(bid, 6) : null,
+    limitPrice: Number.isFinite(limitPrice) ? round(limitPrice, 6) : null,
+    notional: round(notional, 6),
+    visibleDepth: round(visibleDepth, 6),
+    requiredDepth,
+    depthHaircut: round(depthHaircut, 4),
+    depthSufficient,
+    websocketFresh,
+    bookAgeMs: Number.isFinite(bookAgeMs) ? Math.round(bookAgeMs) : null,
+    bookTransport: transport,
+    quoteSource: clone.orderbook?.source || quote?.source || "",
+    quoteUpdatedAt: clone.orderbook?.updatedAt || quote?.updatedAt || "",
+    expectedShares: round(expectedShares, 6),
+    expectedFillCost,
+    expectedFee: round(expectedFee, 6),
+    expectedAvgPrice: expectedShares > 0 ? round(expectedTradeCost / expectedShares, 6) : null,
+    levels,
+  };
+}
+
+function shadowLiveDedupeKey(clone, candidate, preflight) {
+  return [
+    clone.market?.slug || "",
+    clone.legKey || "",
+    candidate?.outcome || "",
+    candidate?.kind || "",
+    candidate?.style || "",
+    preflight.limitPrice ?? "",
+    preflight.status || "",
+  ].join("|");
+}
+
+function hasRecentShadowLiveRecord(clone, dedupeKey, nowSec, cooldownSec = 3) {
+  if (!dedupeKey) return false;
+  return (clone.shadowLive?.orders || []).some((row) => (
+    row.dedupeKey === dedupeKey
+    && nowSec - num(row.ts) <= cooldownSec
+  ));
+}
+
+function recordShadowLiveOrder(clone, spec = {}) {
+  ensureShadowLiveState(clone);
+  const candidate = spec.candidate || {};
+  const nowSec = num(spec.nowSec, Math.floor(Date.now() / 1000));
+  const preflight = spec.preflight || shadowLivePreflight(clone, candidate, spec);
+  const dedupeKey = shadowLiveDedupeKey(clone, candidate, preflight);
+  if (hasRecentShadowLiveRecord(clone, dedupeKey, nowSec, num(spec.dedupeSec, 3))) return null;
+  const realOrderSwitch = clone.config?.realOrderSwitch || buildRealOrderSwitchFromConfig(clone.config || {});
+  clone.shadowLive.nextId = num(clone.shadowLive.nextId, 0) + 1;
+  const order = {
+    id: `shadow-${clone.shadowLive.nextId}`,
+    ts: nowSec,
+    isoTime: isoFromSec(nowSec),
+    slug: clone.market?.slug || "",
+    asset: clone.asset || slugAsset(clone.market?.slug) || "",
+    horizon: clone.horizon || slugHorizon(clone.market?.slug) || "",
+    legKey: clone.legKey || slugLegKey(clone.market?.slug) || "",
+    action: "BUY",
+    direction: candidate.outcome || "",
+    style: "cross",
+    kind: candidate.kind || "",
+    orderType: preflight.orderType,
+    readOnly: !realOrderSwitch.realOrderSubmitAllowed,
+    submitAllowed: Boolean(realOrderSwitch.submitAllowed),
+    realOrderSubmitted: false,
+    realOrderSwitch,
+    submitIntent: Boolean(preflight.submitIntent),
+    status: preflight.status,
+    expectedReceipt: preflight.receipt,
+    limitPrice: preflight.limitPrice,
+    quoteAsk: preflight.ask,
+    quoteBid: preflight.bid,
+    notional: preflight.notional,
+    visibleDepth: preflight.visibleDepth,
+    requiredDepth: preflight.requiredDepth,
+    depthHaircut: preflight.depthHaircut,
+    depthSufficient: preflight.depthSufficient,
+    websocketFresh: preflight.websocketFresh,
+    bookAgeMs: preflight.bookAgeMs,
+    bookTransport: preflight.bookTransport,
+    quoteSource: preflight.quoteSource,
+    quoteUpdatedAt: preflight.quoteUpdatedAt,
+    expectedShares: preflight.expectedShares,
+    expectedFillCost: preflight.expectedFillCost,
+    expectedFee: preflight.expectedFee,
+    expectedAvgPrice: preflight.expectedAvgPrice,
+    feeRate: Number.isFinite(num(candidate.feeRate, NaN)) ? round(candidate.feeRate, 6) : null,
+    edge: Number.isFinite(num(candidate.edge, NaN)) ? round(candidate.edge, 6) : null,
+    signalBps: Number.isFinite(num(candidate.signalBps, NaN)) ? round(candidate.signalBps, 4) : null,
+    confidence: candidate.confidence || "",
+    reason: candidate.reason || "",
+    levels: preflight.levels,
+    dedupeKey,
+    paperOrderId: spec.paperOrderId || "",
+  };
+  clone.shadowLive.orders.unshift(order);
+  clone.shadowLive.orders = clone.shadowLive.orders.slice(0, 500);
+  clone.shadowLive.lastReceipt = order;
+  clone.shadowLive.updatedAt = isoFromSec(nowSec);
+  clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+  return order;
+}
+
+function markShadowLivePaperOrder(clone, order, paperStatus, extra = {}) {
+  const id = order?.shadowLiveOrderId || "";
+  if (!id || !clone?.shadowLive?.orders) return;
+  const row = clone.shadowLive.orders.find((item) => item.id === id);
+  if (!row) return;
+  row.paperOrderId = order.id || row.paperOrderId || "";
+  row.paperStatus = paperStatus;
+  row.paperUpdatedAt = extra.updatedAt || order.updatedAt || order.fillIsoTime || new Date().toISOString();
+  if (Number.isFinite(num(extra.fillCost, NaN))) row.paperFillCost = round(extra.fillCost, 6);
+  if (Number.isFinite(num(extra.fillShares, NaN))) row.paperFillShares = round(extra.fillShares, 6);
+  if (extra.reason) row.paperReason = extra.reason;
+  clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+}
+
 function orderbookTickSize(quote) {
   return Math.max(0.001, num(quote?.tickSize, 0.01));
 }
@@ -2197,6 +3238,45 @@ function visibleAskLevelsAtOrBelow(quote, limitPrice) {
     .sort((a, b) => a.price - b.price);
 }
 
+function smallBankrollFallbackCrossEligible(quote, limitPrice, cfg) {
+  if (!cfg?.smallBankrollFallbackFillEnabled) return false;
+  const source = String(quote?.source || "").toLowerCase();
+  if (!source.includes("fallback")) return false;
+  const ask = finiteNum(quote?.ask);
+  if (!Number.isFinite(ask) || ask <= 0 || ask > limitPrice + 0.000001) return false;
+  if (ask > num(cfg.smallBankrollFallbackCrossMaxAsk, 0.62)) return false;
+  const bid = finiteNum(quote?.bid);
+  const maxSpread = num(cfg.smallBankrollFallbackMaxSpread, 0.08);
+  if (Number.isFinite(bid) && bid > 0 && ask - bid > maxSpread) return false;
+  return true;
+}
+
+function tailRiskFokLikeOrder(order, cfg = {}) {
+  if (cfg.tailRiskScoutFokMode === false) return false;
+  return Boolean(order?.kind === "tail-risk-scout" && order?.style !== "maker-ladder");
+}
+
+function crossFakLikeOrder(order, cfg = {}) {
+  if (cfg.requireWebSocketCrossFill === false) return false;
+  return Boolean(order?.style && order.style !== "maker-ladder");
+}
+
+function tailRiskFokMaxFillAgeMs(order, cfg = {}) {
+  const latencyMs = Math.max(0, num(order?.executionLatencyMs, num(cfg.executionLatencyMs, 600)));
+  return latencyMs + Math.max(0, num(cfg.tailRiskScoutFokFillGraceMs, 900));
+}
+
+function crossFakMaxFillAgeMs(order, cfg = {}) {
+  return tailRiskFokMaxFillAgeMs(order, cfg);
+}
+
+function tailRiskFokBookStaleAfterMs(cfg = {}) {
+  return Math.max(250, Math.min(
+    num(cfg.bookStaleAfterMs, 2500),
+    num(cfg.tailRiskScoutFokBookStaleAfterMs, 1200),
+  ));
+}
+
 function median(values) {
   const rows = values
     .map((value) => num(value, NaN))
@@ -2218,7 +3298,7 @@ function p75(values) {
 
 function takerLimitPrice(ask, cfg) {
   if (!Number.isFinite(num(ask, NaN))) return null;
-  const slipped = ask * (1 + num(cfg.slippageBps) / 10000);
+  const slipped = ask * (1 + num(cfg.slippageBps) / 10000) + num(cfg.takerLimitBufferCents, 0);
   return round(clamp(Math.ceil(slipped * 100) / 100, 0.01, num(cfg.maxAsk, 0.99)), 2);
 }
 
@@ -2285,6 +3365,7 @@ function learnBonereaperStrategy(state, clone, nowSec) {
     };
   }
   const preferredOutcome = byOutcome.Up.usdc > byOutcome.Down.usdc ? "Up" : byOutcome.Down.usdc > byOutcome.Up.usdc ? "Down" : "";
+  const secondaryOutcome = preferredOutcome === "Up" ? "Down" : preferredOutcome === "Down" ? "Up" : "";
   const elapsedRows = Number.isFinite(windowStart)
     ? buys.map((row) => num(row.ts) - windowStart).filter((value) => Number.isFinite(value))
     : [];
@@ -2300,10 +3381,42 @@ function learnBonereaperStrategy(state, clone, nowSec) {
   const totalBuyUsdc = byOutcome.Up.usdc + byOutcome.Down.usdc;
   const preferredUsdc = preferredOutcome ? byOutcome[preferredOutcome].usdc : 0;
   const preferredRows = preferredOutcome ? byOutcome[preferredOutcome].rows : 0;
+  const secondaryUsdc = secondaryOutcome ? byOutcome[secondaryOutcome].usdc : 0;
+  const secondaryRows = secondaryOutcome ? byOutcome[secondaryOutcome].rows : 0;
   const flowDominance = totalBuyUsdc > 0 ? preferredUsdc / totalBuyUsdc : 0;
+  const secondaryShare = totalBuyUsdc > 0 ? secondaryUsdc / totalBuyUsdc : 0;
   const medianWindowBuyRows = median(windows.map((row) => row.buyRows));
   const medianWindowBuyUsdc = median(windows.map((row) => row.buyUsdc));
   const p75WindowBuyRows = p75(windows.map((row) => row.buyRows));
+  const sameLegBuyGroups = new Map();
+  const currentLegKey = slugLegKey(slug);
+  for (const row of state.trades || []) {
+    if (row.action !== "BUY") continue;
+    if (!OUTCOMES.includes(row.direction)) continue;
+    if (row.slug === slug || slugLegKey(row.slug) !== currentLegKey) continue;
+    const existing = sameLegBuyGroups.get(row.slug) || {
+      slug: row.slug,
+      windowStart: slugWindowStart(row.slug),
+      rows: 0,
+      usdc: 0,
+      byOutcome: { Up: { rows: 0, usdc: 0 }, Down: { rows: 0, usdc: 0 } },
+    };
+    existing.rows += 1;
+    existing.usdc += num(row.amountUsdc);
+    existing.byOutcome[row.direction].rows += 1;
+    existing.byOutcome[row.direction].usdc += num(row.amountUsdc);
+    sameLegBuyGroups.set(row.slug, existing);
+  }
+  const historicalWindows = [...sameLegBuyGroups.values()]
+    .filter((row) => Number.isFinite(num(row.windowStart, NaN)) && num(row.usdc) > 0)
+    .sort((a, b) => num(b.windowStart) - num(a.windowStart))
+    .slice(0, 48);
+  const bilateralWindows = historicalWindows.filter((row) => num(row.byOutcome.Up.usdc) > 0 && num(row.byOutcome.Down.usdc) > 0);
+  const minorShares = bilateralWindows
+    .map((row) => Math.min(num(row.byOutcome.Up.usdc), num(row.byOutcome.Down.usdc)) / Math.max(1, num(row.usdc)))
+    .filter((value) => Number.isFinite(value));
+  const bilateralWindowRate = historicalWindows.length ? bilateralWindows.length / historicalWindows.length : 0;
+  const medianMinorShare = median(minorShares);
   const firstBuyElapsedSec = elapsedRows.length ? Math.min(...elapsedRows) : null;
   const lastBuyElapsedSec = elapsedRows.length ? Math.max(...elapsedRows) : null;
   const lastBuyAgeSec = buys.length ? nowSec - num(buys[buys.length - 1].ts) : null;
@@ -2346,6 +3459,7 @@ function learnBonereaperStrategy(state, clone, nowSec) {
     currentObservedBuys: buys.length,
     currentObservedSells: sells.length,
     preferredOutcome,
+    secondaryOutcome,
     byOutcome,
     currentBuyUsdc: round(byOutcome.Up.usdc + byOutcome.Down.usdc, 6),
     firstBuyElapsedSec: Number.isFinite(firstBuyElapsedSec) ? round(firstBuyElapsedSec, 3) : null,
@@ -2356,7 +3470,14 @@ function learnBonereaperStrategy(state, clone, nowSec) {
     totalBuyUsdc: round(totalBuyUsdc, 6),
     preferredUsdc: round(preferredUsdc, 6),
     preferredRows,
+    secondaryUsdc: round(secondaryUsdc, 6),
+    secondaryRows,
     flowDominance: round(flowDominance, 6),
+    secondaryShare: round(secondaryShare, 6),
+    bilateralWindowRate: round(bilateralWindowRate, 6),
+    bilateralWindows: bilateralWindows.length,
+    historicalWindows: historicalWindows.length,
+    medianMinorShare: Number.isFinite(medianMinorShare) ? round(medianMinorShare, 6) : null,
     medianBuyUsdc: Number.isFinite(medianBuyUsdc) ? round(medianBuyUsdc, 6) : null,
     p75BuyUsdc: Number.isFinite(p75BuyUsdc) ? round(p75BuyUsdc, 6) : null,
     medianWindowBuyRows: Number.isFinite(medianWindowBuyRows) ? round(medianWindowBuyRows, 3) : null,
@@ -2402,6 +3523,251 @@ function applyCloneLegCapConfig(clone, cfg, adjustments, suggestions) {
   });
 }
 
+function applyBonereaperLearning5mGuard(clone, cfg, adjustments, suggestions) {
+  const isLearningDensity = String(clone.strategyVersionId || STRATEGY_VERSION_ID) === STRATEGY_VERSION_ID;
+  const horizon = clone.horizon || slugHorizon(clone.market?.slug);
+  if (!isLearningDensity || horizon !== "5m") return;
+  const isEth = (clone.asset || slugAsset(clone.market?.slug)) === "ETH";
+  const stats = cfg.liveReadyStats || {};
+  const observedRows = Math.max(num(cfg.observedWindowBuyRows, 0), num(stats.observedRows, 0));
+  const observedUsdc = Math.max(num(cfg.observedWindowBuyUsdc, 0), num(stats.observedUsdc, 0));
+  const recentFlowRows = Math.max(num(cfg.observedRecentBuyRows30s, 0), num(stats.recentFlowRows, 0));
+  const burstPeak = Math.max(num(cfg.observedBurstPeak1s, 0), num(stats.burstPeak, 0));
+  const medianBuyUsdc = Math.max(num(cfg.observedMedianBuyUsdc, 0), num(stats.observedMedianBuyUsdc, 0));
+  const secondaryRows = num(stats.observedSecondaryRows, 0);
+  const secondaryUsdc = num(stats.observedSecondaryUsdc, 0);
+  const secondaryShare = clamp(num(stats.observedSecondaryShare, 0) / 100, 0, 1);
+  const recent8Pnl = num(stats.recent8Pnl, 0);
+  const recent8WinRate = num(stats.recent8WinRate, 50);
+  const recent24Pnl = num(stats.recent24Pnl, 0);
+  const currentUnrealized = num(stats.currentUnrealized, 0);
+  const flowHot = Boolean(
+    stats.flowLearningHot
+    || observedRows >= (isEth ? 18 : 28)
+    || observedUsdc >= (isEth ? 120 : 220)
+    || recentFlowRows >= (isEth ? 3 : 5)
+    || burstPeak >= (isEth ? 3 : 4)
+  );
+  const drawdownGuard = Boolean(
+    recent8Pnl <= (isEth ? -30 : -45)
+    || recent8WinRate < (isEth ? 43 : 45)
+    || (recent24Pnl < 0 && recent8Pnl < 0)
+    || currentUnrealized <= (isEth ? -18 : -28)
+  );
+  const minRows = isEth ? 14 : 24;
+  const maxRows = isEth ? 56 : 96;
+  const guardRows = isEth ? 8 : 12;
+  const learnedRows = Math.max(
+    minRows,
+    observedRows * (isEth ? 0.32 : 0.38),
+    recentFlowRows * (isEth ? 4 : 5),
+    burstPeak * (isEth ? 6 : 8),
+  );
+  const targetRows = Math.round(drawdownGuard ? guardRows : clamp(learnedRows, minRows, maxRows));
+  const baseOrderUsdc = drawdownGuard
+    ? POLYMARKET_MIN_ORDER_USDC
+    : round(clamp(medianBuyUsdc > 0 ? medianBuyUsdc * (isEth ? 0.48 : 0.55) : POLYMARKET_MIN_ORDER_USDC, POLYMARKET_MIN_ORDER_USDC, isEth ? 8 : 12), 2);
+  const budgetTarget = drawdownGuard
+    ? (isEth ? 28 : 42)
+    : Math.max(
+      isEth ? 45 : 70,
+      targetRows * POLYMARKET_MIN_ORDER_USDC * (isEth ? 0.62 : 0.72),
+      observedUsdc * (isEth ? 0.055 : 0.07),
+    );
+  const budgetCap = isEth ? 280 : 460;
+  const budget = round(clamp(budgetTarget, isEth ? 24 : 36, budgetCap), 2);
+  const participationCap = drawdownGuard ? (isEth ? 0.10 : 0.14) : (isEth ? 0.20 : 0.26);
+  const bilateralHot = Boolean(flowHot && !drawdownGuard && (
+    secondaryRows >= (isEth ? 3 : 5)
+    || secondaryUsdc >= POLYMARKET_MIN_ORDER_USDC * 2
+    || secondaryShare >= (isEth ? 0.12 : 0.14)
+    || num(stats.bilateralWindowRate, 0) >= 55
+  ));
+  cfg.parentConfirmOnly = true;
+  cfg.allowLearnedProbe = flowHot && !drawdownGuard;
+  cfg.allowComboEntry = false;
+  cfg.probeEnabled = flowHot && !drawdownGuard;
+  cfg.probeMaxPerCycle = cfg.probeEnabled ? Math.max(2, Math.min(isEth ? 7 : 12, Math.floor(targetRows * 0.22))) : 0;
+  cfg.inventoryRebalanceRatio = bilateralHot ? (isEth ? 0.16 : 0.22) : 0;
+  cfg.comboEntryMaxCost = 0;
+  cfg.budgetUsdc = budget;
+  cfg.maxDirectionExposureUsdc = round(Math.min(budgetCap, Math.max(POLYMARKET_MIN_ORDER_USDC * 2, budget * (drawdownGuard ? 0.42 : (isEth ? 0.52 : 0.58)))), 2);
+  cfg.orderUsdc = baseOrderUsdc;
+  cfg.probeOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.maxClipUsdc = round(drawdownGuard ? POLYMARKET_MIN_ORDER_USDC : Math.max(baseOrderUsdc, Math.min(isEth ? 14 : 20, medianBuyUsdc > 0 ? medianBuyUsdc * 0.9 : baseOrderUsdc)), 2);
+  cfg.targetOrderRows = targetRows;
+  cfg.maxOrdersPerWindow = cfg.targetOrderRows;
+  cfg.windowParticipationScoutEnabled = true;
+  cfg.windowParticipationTargetRows = targetRows;
+  cfg.windowParticipationScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.windowParticipationScoutMaxPerCycle = drawdownGuard
+    ? (isEth ? 2 : 3)
+    : Math.max(isEth ? 4 : 6, Math.min(isEth ? 9 : 14, Math.ceil(targetRows * (isEth ? 0.15 : 0.16))));
+  cfg.windowParticipationMakerMaxAsk = round(drawdownGuard ? (isEth ? 0.92 : 0.94) : (isEth ? 0.95 : 0.965), 3);
+  cfg.windowParticipationCrossMaxAsk = round(drawdownGuard ? (isEth ? 0.86 : 0.9) : (isEth ? 0.89 : 0.92), 3);
+  cfg.windowParticipationCrossAfterSec = drawdownGuard ? (isEth ? 24 : 20) : (isEth ? 16 : 10);
+  cfg.windowParticipationMinRemainingSec = drawdownGuard ? (isEth ? 18 : 12) : (isEth ? 8 : 5);
+  cfg.windowParticipationFirstCrossEnabled = true;
+  cfg.windowParticipationFirstCrossRows = drawdownGuard ? (isEth ? 3 : 5) : (isEth ? 5 : 8);
+  cfg.windowParticipationFirstCrossMinRemainingSec = drawdownGuard ? (isEth ? 60 : 40) : (isEth ? 45 : 28);
+  cfg.windowParticipationCheapCrossMaxAsk = round(drawdownGuard ? (isEth ? 0.18 : 0.22) : (isEth ? 0.20 : 0.25), 3);
+  cfg.windowParticipationMaxEdgeDebt = round(drawdownGuard ? (isEth ? 0.14 : 0.18) : (isEth ? 0.20 : 0.24), 3);
+  cfg.windowParticipationMaxLocalOpposeBps = round(drawdownGuard ? (isEth ? 8 : 9) : (isEth ? 10 : 12), 3);
+  cfg.minExpectedEdge = round(Math.max(num(cfg.minExpectedEdge), drawdownGuard ? (isEth ? 0.045 : 0.036) : (isEth ? 0.034 : 0.026)), 4);
+  cfg.minSignalBps = round(Math.max(num(cfg.minSignalBps), drawdownGuard ? (isEth ? 5.0 : 4.4) : (isEth ? 4.2 : 3.6)), 3);
+  cfg.liquidityParticipation = round(Math.min(num(cfg.liquidityParticipation, 0.35), participationCap), 3);
+  cfg.tailRiskScoutEnabled = true;
+  cfg.tailRiskScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.tailRiskScoutMaxPerCycle = drawdownGuard ? 1 : (isEth ? 1 : 2);
+  cfg.bilateralInventoryScoutEnabled = bilateralHot;
+  cfg.bilateralInventoryScoutMaxPerCycle = bilateralHot ? (isEth ? 2 : 4) : 0;
+  cfg.bilateralInventoryScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.bilateralInventoryTargetMinorShare = round(clamp(Math.max(secondaryShare, isEth ? 0.14 : 0.16), 0.10, isEth ? 0.26 : 0.32), 3);
+  cfg.liveLearningScoutEnabled = flowHot && !drawdownGuard;
+  cfg.liveLearningScoutMaxPerCycle = cfg.liveLearningScoutEnabled ? (isEth ? 3 : 5) : 0;
+  cfg.flowTouchScoutEnabled = flowHot && !drawdownGuard && observedRows >= (isEth ? 8 : 12);
+  cfg.flowTouchScoutMaxPerCycle = cfg.flowTouchScoutEnabled ? (isEth ? 3 : 6) : 0;
+  cfg.qualityScoutEnabled = Boolean(!drawdownGuard && (cfg.qualityScoutEnabled || (recent8WinRate >= 55 && recent8Pnl > 0)));
+  cfg.qualityScoutMaxPerCycle = cfg.qualityScoutEnabled ? Math.max(1, Math.min(isEth ? 4 : 6, num(cfg.qualityScoutMaxPerCycle, isEth ? 3 : 4))) : 0;
+  cfg.parentSafetyScoutEnabled = !isEth;
+  cfg.parentSafetyScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.parentSafetyScoutMaxPerCycle = cfg.parentSafetyScoutEnabled ? (drawdownGuard ? 1 : 3) : 0;
+  cfg.confidenceCrossScoutEnabled = false;
+  cfg.confidenceCrossScoutMaxPerCycle = 0;
+  cfg.exitEnabled = true;
+  cfg.exitFlipBps = round(Math.max(num(cfg.exitFlipBps), isEth ? 4.2 : 4.0), 3);
+  cfg.exitStopLossPct = round(Math.max(num(cfg.exitStopLossPct), isEth ? 0.18 : 0.16), 3);
+  cfg.exitBeforeEndSec = Math.max(num(cfg.exitBeforeEndSec), isEth ? 80 : 60);
+  cfg.riskTrancheEnabled = true;
+  cfg.windowLossStopUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(drawdownGuard ? budget * 0.16 : budget * 0.22, isEth ? 42 : 65)), 2);
+  cfg.directionLossStopUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(cfg.windowLossStopUsdc * 0.72, isEth ? 28 : 45)), 2);
+  adjustments.v40BonereaperLearningDensity = true;
+  Object.assign(adjustments, {
+    flowHot,
+    drawdownGuard,
+    observedWindowBuyRows: observedRows,
+    observedWindowBuyUsdc: round(observedUsdc, 4),
+    observedRecentBuyRows30s: recentFlowRows,
+    observedBurstPeak1s: burstPeak,
+    observedSecondaryRows: secondaryRows,
+    observedSecondaryUsdc: round(secondaryUsdc, 4),
+    observedSecondaryShare: round(secondaryShare, 3),
+    budgetUsdc: cfg.budgetUsdc,
+    maxDirectionExposureUsdc: cfg.maxDirectionExposureUsdc,
+    orderUsdc: cfg.orderUsdc,
+    probeOrderUsdc: cfg.probeOrderUsdc,
+    maxClipUsdc: cfg.maxClipUsdc,
+    targetOrderRows: cfg.targetOrderRows,
+    maxOrdersPerWindow: cfg.maxOrdersPerWindow,
+    windowParticipationTargetRows: cfg.windowParticipationTargetRows,
+    windowParticipationScoutOrderUsdc: cfg.windowParticipationScoutOrderUsdc,
+    windowParticipationScoutMaxPerCycle: cfg.windowParticipationScoutMaxPerCycle,
+    windowParticipationMakerMaxAsk: cfg.windowParticipationMakerMaxAsk,
+    windowParticipationCrossMaxAsk: cfg.windowParticipationCrossMaxAsk,
+    windowParticipationCrossAfterSec: cfg.windowParticipationCrossAfterSec,
+    windowParticipationMinRemainingSec: cfg.windowParticipationMinRemainingSec,
+    windowParticipationFirstCrossEnabled: cfg.windowParticipationFirstCrossEnabled,
+    windowParticipationFirstCrossRows: cfg.windowParticipationFirstCrossRows,
+    windowParticipationFirstCrossMinRemainingSec: cfg.windowParticipationFirstCrossMinRemainingSec,
+    windowParticipationMaxEdgeDebt: cfg.windowParticipationMaxEdgeDebt,
+    windowParticipationMaxLocalOpposeBps: cfg.windowParticipationMaxLocalOpposeBps,
+    minExpectedEdge: cfg.minExpectedEdge,
+    minSignalBps: cfg.minSignalBps,
+    liquidityParticipation: cfg.liquidityParticipation,
+    tailRiskScoutEnabled: cfg.tailRiskScoutEnabled,
+    tailRiskScoutMaxPerCycle: cfg.tailRiskScoutMaxPerCycle,
+    bilateralInventoryScoutEnabled: cfg.bilateralInventoryScoutEnabled,
+    bilateralInventoryScoutMaxPerCycle: cfg.bilateralInventoryScoutMaxPerCycle,
+    liveLearningScoutEnabled: cfg.liveLearningScoutEnabled,
+    liveLearningScoutMaxPerCycle: cfg.liveLearningScoutMaxPerCycle,
+    flowTouchScoutEnabled: cfg.flowTouchScoutEnabled,
+    flowTouchScoutMaxPerCycle: cfg.flowTouchScoutMaxPerCycle,
+    qualityScoutEnabled: cfg.qualityScoutEnabled,
+    qualityScoutMaxPerCycle: cfg.qualityScoutMaxPerCycle,
+    parentSafetyScoutEnabled: cfg.parentSafetyScoutEnabled,
+    parentSafetyScoutMaxPerCycle: cfg.parentSafetyScoutMaxPerCycle,
+    confidenceCrossScoutEnabled: cfg.confidenceCrossScoutEnabled,
+    confidenceCrossScoutMaxPerCycle: cfg.confidenceCrossScoutMaxPerCycle,
+    exitEnabled: cfg.exitEnabled,
+    exitFlipBps: cfg.exitFlipBps,
+    exitStopLossPct: cfg.exitStopLossPct,
+    exitBeforeEndSec: cfg.exitBeforeEndSec,
+    windowLossStopUsdc: cfg.windowLossStopUsdc,
+    directionLossStopUsdc: cfg.directionLossStopUsdc,
+  });
+  suggestions.push(isEth
+    ? `v40 Bonereaper learning density: ETH 5m targets ${targetRows} rows from public flow, ${drawdownGuard ? "drawdown guard active" : "bilateral learning active"}`
+    : `v40 Bonereaper learning density: BTC 5m targets ${targetRows} rows from public flow, ${drawdownGuard ? "drawdown guard active" : "bilateral learning active"}`);
+}
+
+function applyStrictExecutionModel(clone, cfg, adjustments, suggestions) {
+  const smallBankroll = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
+  const horizon = clone.horizon || slugHorizon(clone.market?.slug);
+  const is5m = horizon === "5m";
+  cfg.strictExecutionModel = true;
+  cfg.executionLatencyMs = Math.max(600, num(cfg.executionLatencyMs, 600));
+  cfg.queueDelaySec = Math.max(smallBankroll ? 2 : 1, num(cfg.queueDelaySec, 1));
+  cfg.bookStaleAfterMs = Math.max(1200, num(cfg.bookStaleAfterMs, 2500));
+  cfg.takerDepthHaircut = round(clamp(num(cfg.takerDepthHaircut, 0.72), 0.05, smallBankroll ? 0.62 : 0.72), 3);
+  cfg.makerDepthHaircut = round(clamp(num(cfg.makerDepthHaircut, 0.42), 0.01, smallBankroll ? 0.24 : 0.36), 3);
+  cfg.makerQueueAheadPct = round(clamp(num(cfg.makerQueueAheadPct, 0.72), smallBankroll ? 0.82 : 0.72, 0.96), 3);
+  cfg.allowSnapshotTakerFill = false;
+  cfg.allowSyntheticFallbackFill = false;
+  cfg.takerSnapshotFillGraceSec = 0;
+  cfg.useWebSocketOrderbook = cfg.useWebSocketOrderbook !== false;
+  cfg.requireWebSocketCrossFill = cfg.requireWebSocketCrossFill !== false;
+  cfg.liveReadyMaxBookAgeMs = Math.max(500, num(cfg.liveReadyMaxBookAgeMs, 1000));
+  cfg.liveReadyMinWindows = Math.max(0, num(cfg.liveReadyMinWindows, 48));
+  cfg.liveReadyMinFokOrders = Math.max(0, num(cfg.liveReadyMinFokOrders, 8));
+  cfg.liveReadyMinFokFillRate = clamp(num(cfg.liveReadyMinFokFillRate, 0.35), 0, 1);
+  cfg.liveReadyMaxAdverseRate = clamp(num(cfg.liveReadyMaxAdverseRate, 0.45), 0, 1);
+  cfg.tailRiskScoutFokMode = true;
+  cfg.tailRiskScoutFokFillGraceMs = Math.max(600, num(cfg.tailRiskScoutFokFillGraceMs, 900));
+  cfg.tailRiskScoutFokBookStaleAfterMs = Math.min(
+    num(cfg.bookStaleAfterMs, 2500),
+    Math.max(750, num(cfg.tailRiskScoutFokBookStaleAfterMs, 1200)),
+  );
+  cfg.minFillUsdc = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minFillUsdc, POLYMARKET_MIN_ORDER_USDC));
+  cfg.minVisibleDepthUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC),
+    smallBankroll ? POLYMARKET_MIN_ORDER_USDC : (is5m ? POLYMARKET_MIN_ORDER_USDC * 1.2 : POLYMARKET_MIN_ORDER_USDC * 1.4),
+  ), 3);
+  if (smallBankroll) {
+    cfg.smallBankrollFallbackFillEnabled = false;
+    cfg.smallBankrollFallbackSyntheticDepthUsdc = 0;
+  }
+  Object.assign(adjustments, {
+    strictExecutionModel: true,
+    executionLatencyMs: cfg.executionLatencyMs,
+    queueDelaySec: cfg.queueDelaySec,
+    bookStaleAfterMs: cfg.bookStaleAfterMs,
+    takerDepthHaircut: cfg.takerDepthHaircut,
+    makerDepthHaircut: cfg.makerDepthHaircut,
+    makerQueueAheadPct: cfg.makerQueueAheadPct,
+    allowSnapshotTakerFill: cfg.allowSnapshotTakerFill,
+    allowSyntheticFallbackFill: cfg.allowSyntheticFallbackFill,
+    takerSnapshotFillGraceSec: cfg.takerSnapshotFillGraceSec,
+    useWebSocketOrderbook: cfg.useWebSocketOrderbook,
+    requireWebSocketCrossFill: cfg.requireWebSocketCrossFill,
+    liveReadyMaxBookAgeMs: cfg.liveReadyMaxBookAgeMs,
+    liveReadyMinWindows: cfg.liveReadyMinWindows,
+    liveReadyMinFokOrders: cfg.liveReadyMinFokOrders,
+    liveReadyMinFokFillRate: cfg.liveReadyMinFokFillRate,
+    liveReadyMaxAdverseRate: cfg.liveReadyMaxAdverseRate,
+    tailRiskScoutFokMode: cfg.tailRiskScoutFokMode,
+    tailRiskScoutFokFillGraceMs: cfg.tailRiskScoutFokFillGraceMs,
+    tailRiskScoutFokBookStaleAfterMs: cfg.tailRiskScoutFokBookStaleAfterMs,
+    minVisibleDepthUsdc: cfg.minVisibleDepthUsdc,
+    minFillUsdc: cfg.minFillUsdc,
+    smallBankrollFallbackFillEnabled: cfg.smallBankrollFallbackFillEnabled,
+    smallBankrollFallbackSyntheticDepthUsdc: cfg.smallBankrollFallbackSyntheticDepthUsdc,
+  });
+  suggestions.push(smallBankroll
+    ? "50U strict execution: no synthetic depth, 600ms latency, queue delay, 5U visible-depth minimum, WebSocket-fresh cross fills and tail-risk FAK/FOK only"
+    : "strict execution: WebSocket-fresh cross fills only after latency, queue/depth haircuts, no stale snapshot fills, tail-risk FAK/FOK only");
+}
+
 function performanceStats(rows) {
   const cost = rows.reduce((total, row) => total + num(row.cost), 0);
   const pnl = rows.reduce((total, row) => total + num(row.pnl), 0);
@@ -2429,6 +3795,214 @@ function performanceStats(rows) {
   };
 }
 
+function executionStatsFromOrdersAndFills(orders = [], fills = [], maxBookAgeMs = 1000) {
+  const orderRows = Array.isArray(orders) ? orders : [];
+  const fillRows = Array.isArray(fills) ? fills : [];
+  const crossOrders = orderRows.filter((order) => order.style !== "maker-ladder").length;
+  const fokLikeOrders = orderRows.filter((order) => Boolean(order.fokLike || order.style !== "maker-ladder")).length;
+  const expiredFokLikeOrders = orderRows.filter((order) => (
+    Boolean(order.fokLike || order.style !== "maker-ladder")
+    && String(order.status || "").startsWith("EXPIRED")
+  )).length;
+  const fokLikeFills = fillRows.filter((fill) => fill.fokLikeFill);
+  const fokFilledOrderIds = new Set(fokLikeFills.map((fill) => fill.orderId).filter(Boolean));
+  const bookAgeRows = fillRows.filter((fill) => Number.isFinite(num(fill.bookAgeMs, NaN)));
+  const freshBookFills = bookAgeRows.filter((fill) => num(fill.bookAgeMs) <= maxBookAgeMs).length;
+  const wsBookFills = fillRows.filter((fill) => String(fill.bookTransport || "").toLowerCase() === "websocket").length;
+  const avgBookAgeMs = bookAgeRows.length
+    ? bookAgeRows.reduce((total, fill) => total + num(fill.bookAgeMs), 0) / bookAgeRows.length
+    : null;
+  return {
+    orders: orderRows.length,
+    fills: fillRows.length,
+    crossOrders,
+    fokLikeOrders,
+    fokLikeFilledOrders: fokFilledOrderIds.size || fokLikeFills.length,
+    fokLikeFills: fokLikeFills.length,
+    fokLikeExpiredOrders: expiredFokLikeOrders,
+    fokLikeFillRate: fokLikeOrders ? round((fokFilledOrderIds.size || fokLikeFills.length) / fokLikeOrders, 4) : null,
+    bookAgeCheckedFills: bookAgeRows.length,
+    freshBookFills,
+    freshBookFillRate: bookAgeRows.length ? round(freshBookFills / bookAgeRows.length, 4) : null,
+    wsBookFills,
+    wsBookFillRate: fillRows.length ? round(wsBookFills / fillRows.length, 4) : null,
+    avgBookAgeMs: avgBookAgeMs == null ? null : round(avgBookAgeMs, 1),
+    maxBookAgeMs,
+  };
+}
+
+function mergeExecutionStats(statsRows = []) {
+  const base = {
+    orders: 0,
+    fills: 0,
+    crossOrders: 0,
+    fokLikeOrders: 0,
+    fokLikeFilledOrders: 0,
+    fokLikeFills: 0,
+    fokLikeExpiredOrders: 0,
+    bookAgeCheckedFills: 0,
+    freshBookFills: 0,
+    wsBookFills: 0,
+    avgBookAgeWeightedTotal: 0,
+    maxBookAgeMs: 1000,
+  };
+  for (const stats of statsRows || []) {
+    if (!stats) continue;
+    base.orders += num(stats.orders);
+    base.fills += num(stats.fills);
+    base.crossOrders += num(stats.crossOrders);
+    base.fokLikeOrders += num(stats.fokLikeOrders);
+    base.fokLikeFilledOrders += num(stats.fokLikeFilledOrders);
+    base.fokLikeFills += num(stats.fokLikeFills);
+    base.fokLikeExpiredOrders += num(stats.fokLikeExpiredOrders);
+    base.bookAgeCheckedFills += num(stats.bookAgeCheckedFills);
+    base.freshBookFills += num(stats.freshBookFills);
+    base.wsBookFills += num(stats.wsBookFills);
+    if (Number.isFinite(num(stats.avgBookAgeMs, NaN)) && num(stats.bookAgeCheckedFills) > 0) {
+      base.avgBookAgeWeightedTotal += num(stats.avgBookAgeMs) * num(stats.bookAgeCheckedFills);
+    }
+    base.maxBookAgeMs = Math.max(num(base.maxBookAgeMs, 1000), num(stats.maxBookAgeMs, 1000));
+  }
+  return {
+    orders: base.orders,
+    fills: base.fills,
+    crossOrders: base.crossOrders,
+    fokLikeOrders: base.fokLikeOrders,
+    fokLikeFilledOrders: base.fokLikeFilledOrders,
+    fokLikeFills: base.fokLikeFills,
+    fokLikeExpiredOrders: base.fokLikeExpiredOrders,
+    fokLikeFillRate: base.fokLikeOrders ? round(base.fokLikeFilledOrders / base.fokLikeOrders, 4) : null,
+    bookAgeCheckedFills: base.bookAgeCheckedFills,
+    freshBookFills: base.freshBookFills,
+    freshBookFillRate: base.bookAgeCheckedFills ? round(base.freshBookFills / base.bookAgeCheckedFills, 4) : null,
+    wsBookFills: base.wsBookFills,
+    wsBookFillRate: base.fills ? round(base.wsBookFills / base.fills, 4) : null,
+    avgBookAgeMs: base.bookAgeCheckedFills ? round(base.avgBookAgeWeightedTotal / base.bookAgeCheckedFills, 1) : null,
+    maxBookAgeMs: base.maxBookAgeMs,
+  };
+}
+
+function liveTradeReadinessStats(state, clone, cfg) {
+  const versionId = String(clone.strategyVersionId || STRATEGY_VERSION_ID);
+  const legKey = clone.legKey || slugLegKey(clone.market?.slug);
+  const sameVersionLeg = (row) => (
+    String(row.strategyVersionId || "") === versionId
+    && (!clone.ledgerResetId || String(row.ledgerResetId || "") === String(clone.ledgerResetId))
+    && String(row.legKey || slugLegKey(row.slug)) === String(legKey)
+  );
+  const rows = (state.cloneHistory || []).filter(sameVersionLeg);
+  const activeStats = executionStatsFromOrdersAndFills(clone.orders || [], clone.fills || [], num(cfg.liveReadyMaxBookAgeMs, 1000));
+  const archivedStats = mergeExecutionStats(rows.map((row) => row.executionStats));
+  const executionStats = mergeExecutionStats([activeStats, archivedStats]);
+  const shadowOrders = [
+    ...(clone.shadowLive?.orders || []),
+    ...rows.flatMap((row) => Array.isArray(row.shadowLive?.orders) ? row.shadowLive.orders : []),
+  ];
+  const shadowStats = shadowLiveStats(shadowOrders);
+  shadowStats.expectedFillRate = shadowStats.attempts ? round(shadowStats.expectedFilled / shadowStats.attempts, 4) : null;
+  shadowStats.submitIntentRate = shadowStats.attempts ? round(shadowStats.wouldSubmit / shadowStats.attempts, 4) : null;
+  const fillRows = [
+    ...(clone.fills || []),
+    ...rows.flatMap((row) => Array.isArray(row.fills) ? row.fills : []),
+  ];
+  const adverseRows = fillRows.filter((fill) => typeof fill.adverseSelection === "boolean");
+  const adverseCount = adverseRows.filter((fill) => fill.adverseSelection).length;
+  const adverseRate = adverseRows.length ? adverseCount / adverseRows.length : 0;
+  const bookFreshness = cloneOrderbookFreshness(clone, cfg);
+  const reasons = [];
+  if (cfg.useWebSocketOrderbook !== false && !bookFreshness.allOutcomesWebSocketFresh) {
+    reasons.push(`WebSocket orderbook not fresh (${bookFreshness.websocketFreshOutcomes}/2 outcomes)`);
+  }
+  if (rows.length < num(cfg.liveReadyMinWindows, 48)) {
+    reasons.push(`need ${num(cfg.liveReadyMinWindows, 48)} strict-version windows, have ${rows.length}`);
+  }
+  if (num(cfg.liveReadyMinFokOrders, 8) > 0 && executionStats.fokLikeOrders < num(cfg.liveReadyMinFokOrders, 8)) {
+    reasons.push(`need ${num(cfg.liveReadyMinFokOrders, 8)} FAK/FOK attempts, have ${executionStats.fokLikeOrders}`);
+  } else if (executionStats.fokLikeFillRate != null && executionStats.fokLikeFillRate < num(cfg.liveReadyMinFokFillRate, 0.35)) {
+    reasons.push(`FAK/FOK fill rate ${round(executionStats.fokLikeFillRate * 100, 1)}% below ${round(num(cfg.liveReadyMinFokFillRate, 0.35) * 100, 1)}%`);
+  }
+  if (adverseRows.length >= 8 && adverseRate > num(cfg.liveReadyMaxAdverseRate, 0.45)) {
+    reasons.push(`adverse selection ${round(adverseRate * 100, 1)}% above ${round(num(cfg.liveReadyMaxAdverseRate, 0.45) * 100, 1)}%`);
+  }
+  if (executionStats.bookAgeCheckedFills >= 4 && executionStats.freshBookFillRate != null && executionStats.freshBookFillRate < 0.9) {
+    reasons.push(`fresh-book fill rate ${round(executionStats.freshBookFillRate * 100, 1)}% below 90%`);
+  }
+  return {
+    ready: reasons.length === 0,
+    reasons,
+    legKey,
+    versionId,
+    strictVersionWindows: rows.length,
+    thresholds: {
+      maxBookAgeMs: num(cfg.liveReadyMaxBookAgeMs, 1000),
+      minWindows: num(cfg.liveReadyMinWindows, 48),
+      minFokOrders: num(cfg.liveReadyMinFokOrders, 8),
+      minFokFillRate: num(cfg.liveReadyMinFokFillRate, 0.35),
+      maxAdverseRate: num(cfg.liveReadyMaxAdverseRate, 0.45),
+    },
+    orderbook: bookFreshness,
+    execution: executionStats,
+    shadowLive: shadowStats,
+    adverse: {
+      checked: adverseRows.length,
+      adverse: adverseCount,
+      rate: round(adverseRate, 4),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyLiveTradeReadinessGuard(state, clone, cfg, adjustments, suggestions) {
+  const readiness = liveTradeReadinessStats(state, clone, cfg);
+  cfg.liveTradeReady = Boolean(readiness.ready);
+  cfg.liveTradeReadiness = readiness;
+  cfg.shadowLiveEnabled = true;
+  cfg.shadowLiveOrderType = "FAK/IOC";
+  cfg.realOrderSwitch = buildRealOrderSwitchFromConfig(cfg, readiness);
+  cfg.shadowLiveMode = cfg.realOrderSwitch.mode || "read-only";
+  cfg.realOrderSubmitAllowed = Boolean(cfg.realOrderSwitch.realOrderSubmitAllowed);
+  adjustments.liveTradeReady = cfg.liveTradeReady;
+  adjustments.liveTradeReadiness = cfg.liveTradeReadiness;
+  adjustments.shadowLiveEnabled = true;
+  adjustments.shadowLiveMode = cfg.shadowLiveMode;
+  adjustments.shadowLiveOrderType = cfg.shadowLiveOrderType;
+  adjustments.realOrderSwitch = cfg.realOrderSwitch;
+  adjustments.realOrderSubmitAllowed = cfg.realOrderSubmitAllowed;
+  if (clone?.shadowLive) {
+    clone.shadowLive.mode = cfg.shadowLiveMode;
+    clone.shadowLive.submitAllowed = Boolean(cfg.realOrderSwitch.submitAllowed);
+    clone.shadowLive.realOrderSubmitAllowed = cfg.realOrderSubmitAllowed;
+    clone.shadowLive.realOrderSwitch = cfg.realOrderSwitch;
+  }
+  if (readiness.ready) {
+    suggestions.push(`live trade gate ready: ${readiness.legKey} has fresh WebSocket book, FAK/FOK sample and adverse checks`);
+  } else {
+    suggestions.push(`live trade gate blocked: ${readiness.reasons.slice(0, 3).join("; ")}`);
+  }
+}
+
+function smallBankrollPortfolioCommitment(state, currentClone) {
+  const assets = Object.values(state.clonePortfolio?.assets || {});
+  let total = 0;
+  let current = 0;
+  const currentSlug = currentClone?.market?.slug || "";
+  const currentLeg = currentClone?.legKey || slugLegKey(currentSlug);
+  for (const row of assets) {
+    const committed = round(cloneSpent(row) + clonePending(row), 6);
+    total += committed;
+    const rowSlug = row?.market?.slug || "";
+    const rowLeg = row?.legKey || slugLegKey(rowSlug);
+    if (row === currentClone || (currentSlug && rowSlug === currentSlug) || (currentLeg && rowLeg === currentLeg)) {
+      current = Math.max(current, committed);
+    }
+  }
+  return {
+    total: round(total, 6),
+    current: round(current, 6),
+    other: round(Math.max(0, total - current), 6),
+  };
+}
+
 function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions) {
   const bankroll = num(cfg.bankrollUsdc, 0);
   if (bankroll <= 0 || bankroll > 100) return;
@@ -2445,8 +4019,42 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
   const recent6 = performanceStats(legRows.slice(0, 6));
   const recent12 = performanceStats(legRows.slice(0, 12));
   const portfolio = performanceStats(portfolioRows);
-  const legCap = finiteNum(cfg.legCapUsdc, null) ?? Math.max(POLYMARKET_MIN_ORDER_USDC, bankroll * 0.25);
-  if (legCap < POLYMARKET_MIN_ORDER_USDC) return;
+  const commitment = smallBankrollPortfolioCommitment(state, clone);
+  const portfolioCapUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, bankroll * 0.72), 2);
+  const rawLegCap = finiteNum(cfg.legCapUsdc, null) ?? Math.max(POLYMARKET_MIN_ORDER_USDC, bankroll * 0.25);
+  const availableForLeg = Math.max(commitment.current, portfolioCapUsdc - commitment.other);
+  const legCap = Math.min(rawLegCap, availableForLeg);
+  if (legCap < POLYMARKET_MIN_ORDER_USDC) {
+    cfg.budgetUsdc = 0;
+    cfg.maxDirectionExposureUsdc = 0;
+    cfg.orderUsdc = POLYMARKET_MIN_ORDER_USDC;
+    cfg.probeOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+    cfg.maxClipUsdc = POLYMARKET_MIN_ORDER_USDC;
+    cfg.targetOrderRows = 0;
+    cfg.maxOrdersPerWindow = 0;
+    cfg.smallBankrollMode = "portfolio-cap";
+    cfg.smallBankrollStats = {
+      bankroll,
+      legKey,
+      portfolioCapUsdc,
+      portfolioCommittedUsdc: commitment.total,
+      portfolioOtherCommittedUsdc: commitment.other,
+      portfolioAvailableForLegUsdc: round(availableForLeg, 2),
+    };
+    Object.assign(adjustments, {
+      smallBankrollMode: cfg.smallBankrollMode,
+      smallBankrollStats: cfg.smallBankrollStats,
+      budgetUsdc: cfg.budgetUsdc,
+      maxDirectionExposureUsdc: cfg.maxDirectionExposureUsdc,
+      orderUsdc: cfg.orderUsdc,
+      probeOrderUsdc: cfg.probeOrderUsdc,
+      maxClipUsdc: cfg.maxClipUsdc,
+      targetOrderRows: cfg.targetOrderRows,
+      maxOrdersPerWindow: cfg.maxOrdersPerWindow,
+    });
+    suggestions.push(`50U portfolio cap reached: ${round(commitment.total, 2)}U committed of ${portfolioCapUsdc}U, no new ${legKey} order`);
+    return;
+  }
 
   const isEth = (clone.asset || slugAsset(clone.market?.slug)) === "ETH";
   const horizon = clone.horizon || slugHorizon(clone.market?.slug);
@@ -2466,27 +4074,27 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
     && recent6.pnl > 0;
 
   const profile = is5m
-    ? (isEth
+      ? (isEth
       ? {
-        starterBudget: 1,
+        starterBudget: 5,
         starterRows: 1,
-        starterClip: 1,
+        starterClip: 5,
         starterEdge: 0.072,
         starterSignal: 7.2,
         starterMaxAsk: 0.78,
         starterDepth: 5,
         starterParticipation: 0.06,
-        probeBudget: 1,
+        probeBudget: 5,
         probeRows: 1,
-        probeClip: 1,
+        probeClip: 5,
         probeEdge: 0.085,
         probeSignal: 8.2,
         probeMaxAsk: 0.75,
         probeDepth: 6,
         probeParticipation: 0.05,
-        scaleBudget: 1,
+        scaleBudget: 5,
         scaleRows: 1,
-        scaleClip: 1,
+        scaleClip: 5,
         scaleEdge: 0.066,
         scaleSignal: 6.8,
         scaleMaxAsk: 0.8,
@@ -2494,52 +4102,52 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
         scaleParticipation: 0.07,
       }
       : {
-        starterBudget: 2,
-        starterRows: 3,
-        starterClip: 1,
-        starterEdge: 0.024,
-        starterSignal: 3,
+        starterBudget: 10,
+        starterRows: 2,
+        starterClip: 5,
+        starterEdge: 0.022,
+        starterSignal: 2.6,
         starterMaxAsk: 0.87,
-        starterDepth: 2,
-        starterParticipation: 0.12,
-        probeBudget: 1,
-        probeRows: 2,
-        probeClip: 1,
+        starterDepth: 2.5,
+        starterParticipation: 0.14,
+        probeBudget: 5,
+        probeRows: 1,
+        probeClip: 5,
         probeEdge: 0.022,
         probeSignal: 3.2,
         probeMaxAsk: 0.84,
-        probeDepth: 2.5,
+        probeDepth: 3,
         probeParticipation: 0.09,
-        scaleBudget: 3,
-        scaleRows: 4,
-        scaleClip: 1,
-        scaleEdge: 0.022,
-        scaleSignal: 4.4,
+        scaleBudget: 12.5,
+        scaleRows: 3,
+        scaleClip: 5,
+        scaleEdge: 0.02,
+        scaleSignal: 4,
         scaleMaxAsk: 0.88,
-        scaleDepth: 2,
-        scaleParticipation: 0.16,
+        scaleDepth: 2.5,
+        scaleParticipation: 0.18,
       })
     : (isEth
       ? {
-        starterBudget: 2,
-        starterRows: 2,
-        starterClip: 1,
+        starterBudget: 5,
+        starterRows: 1,
+        starterClip: 5,
         starterEdge: 0.058,
         starterSignal: 6.4,
         starterMaxAsk: 0.82,
         starterDepth: 4.8,
         starterParticipation: 0.08,
-        probeBudget: 1,
+        probeBudget: 5,
         probeRows: 1,
-        probeClip: 1,
+        probeClip: 5,
         probeEdge: 0.075,
         probeSignal: 7.8,
         probeMaxAsk: 0.78,
         probeDepth: 5.5,
         probeParticipation: 0.06,
-        scaleBudget: 3,
+        scaleBudget: 7.5,
         scaleRows: 2,
-        scaleClip: 1.25,
+        scaleClip: 5,
         scaleEdge: 0.052,
         scaleSignal: 5.6,
         scaleMaxAsk: 0.84,
@@ -2547,30 +4155,30 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
         scaleParticipation: 0.12,
       }
       : {
-        starterBudget: 3,
-        starterRows: 3,
-        starterClip: 1.2,
-        starterEdge: 0.048,
-        starterSignal: 5,
+        starterBudget: 10,
+        starterRows: 2,
+        starterClip: 5,
+        starterEdge: 0.042,
+        starterSignal: 4.4,
         starterMaxAsk: 0.86,
         starterDepth: 3.5,
-        starterParticipation: 0.1,
-        probeBudget: 2,
-        probeRows: 2,
-        probeClip: 1,
+        starterParticipation: 0.14,
+        probeBudget: 5,
+        probeRows: 1,
+        probeClip: 5,
         probeEdge: 0.064,
         probeSignal: 6.6,
         probeMaxAsk: 0.82,
         probeDepth: 4.8,
         probeParticipation: 0.08,
-        scaleBudget: 3,
-        scaleRows: 4,
-        scaleClip: 1.5,
-        scaleEdge: 0.042,
-        scaleSignal: 4.5,
+        scaleBudget: 12.5,
+        scaleRows: 3,
+        scaleClip: 5,
+        scaleEdge: 0.038,
+        scaleSignal: 4.2,
         scaleMaxAsk: 0.88,
         scaleDepth: 3.5,
-        scaleParticipation: 0.18,
+        scaleParticipation: 0.2,
       });
 
   let mode = "starter";
@@ -2643,15 +4251,42 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
   cfg.highConfidenceMaxAsk = round(Math.max(num(cfg.maxAsk), isEth ? (is5m ? 0.89 : 0.86) : (is5m ? 0.92 : 0.9)), 3);
   cfg.minVisibleDepthUsdc = round(Math.max(num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC), minVisibleDepth), 3);
   cfg.liquidityParticipation = round(Math.min(num(cfg.liquidityParticipation, 0.35), participation), 3);
-  cfg.orderTtlSec = is5m ? Math.min(num(cfg.orderTtlSec, 75), mode === "scale" ? 75 : 45) : Math.min(num(cfg.orderTtlSec, 75), 90);
+  cfg.orderTtlSec = is5m ? Math.max(num(cfg.orderTtlSec, 75), 120) : Math.min(num(cfg.orderTtlSec, 75), mode === "scale" ? 75 : 60);
   cfg.minFillPrice = round(Math.max(num(cfg.minFillPrice, 0.01), isEth ? 0.1 : 0.08), 3);
-  cfg.smallBankrollMakerOnly = Boolean(mode !== "scale" || is5m);
+  cfg.smallBankrollMakerOnly = Boolean(!is5m && mode !== "scale");
+  cfg.smallBankrollFallbackFillEnabled = true;
+  cfg.smallBankrollFallbackSyntheticDepthUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.smallBankrollFallbackCrossMaxAsk = round(isEth ? (is5m ? 0.62 : 0.58) : (is5m ? 0.66 : 0.6), 3);
+  cfg.smallBankrollFallbackMaxSpread = round(is5m ? 0.12 : 0.08, 3);
+  cfg.smallBankrollSignalFallbackEnabled = true;
+  cfg.smallBankrollSignalFallbackMinBps = round(is5m ? (isEth ? 9.5 : 8) : (isEth ? 8.8 : 7.4), 3);
+  cfg.smallBankrollSignalFallbackMaxAsk = round(is5m ? (isEth ? 0.93 : 0.95) : (isEth ? 0.89 : 0.91), 3);
+  cfg.smallBankrollSignalFallbackMaxVelocityOpposeBps = round(is5m ? 1.4 : 1, 3);
+  cfg.takerSnapshotFillGraceSec = round(is5m ? 2.6 : 3.2, 2);
+  cfg.windowParticipationScoutEnabled = true;
+  cfg.windowParticipationTargetRows = Math.max(num(cfg.windowParticipationTargetRows, 0), cfg.targetOrderRows);
+  cfg.windowParticipationScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.windowParticipationMakerMaxAsk = round(Math.min(num(cfg.maxAsk, 0.86), is5m ? 0.84 : 0.78), 3);
+  cfg.windowParticipationCrossMaxAsk = round(Math.min(cfg.smallBankrollFallbackCrossMaxAsk, is5m ? 0.64 : 0.58), 3);
+  cfg.windowParticipationCrossAfterSec = is5m ? 10 : 35;
+  cfg.windowParticipationMinRemainingSec = is5m ? 24 : 75;
+  cfg.windowParticipationMaxLocalOpposeBps = round(is5m ? 8.5 : 7.2, 3);
+  cfg.windowParticipationMaxEdgeDebt = round(is5m ? 0.075 : 0.055, 4);
+  cfg.tailRiskScoutEnabled = true;
+  cfg.tailRiskScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.tailRiskScoutMaxPerCycle = 1;
+  cfg.tailRiskScoutFavoriteMinAsk = round(is5m ? 0.94 : 0.92, 3);
+  cfg.tailRiskScoutMaxAsk = round(is5m ? 0.035 : 0.03, 3);
+  cfg.tailRiskScoutCrossMaxAsk = round(is5m ? 0.025 : 0.02, 3);
+  cfg.tailRiskScoutMinSignalBps = round(is5m ? 4.2 : 4.8, 3);
+  cfg.tailRiskScoutMinRemainingSec = is5m ? 8 : 35;
   cfg.riskTrancheEnabled = true;
   cfg.exitEnabled = true;
   cfg.exitFlipBps = round(is5m ? (isEth ? 5.4 : 4.6) : (isEth ? 6.2 : 4.8), 3);
   cfg.exitStopLossPct = round(is5m ? (isEth ? 0.18 : 0.16) : (isEth ? 0.22 : 0.18), 3);
   cfg.exitBeforeEndSec = Math.max(num(cfg.exitBeforeEndSec), is5m ? 35 : 80);
   cfg.initialBudgetFraction = round(is5m ? 1 : 0.7, 3);
+  cfg.strongBudgetFraction = round(isEth ? 0.88 : 1, 3);
   cfg.profitBudgetFraction = round(is5m ? 1 : 0.9, 3);
   cfg.adverseBudgetFraction = round(isEth ? 0.18 : 0.24, 3);
   cfg.windowLossStopUsdc = POLYMARKET_MIN_ORDER_USDC;
@@ -2668,6 +4303,10 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
     recent12Pnl: round(recent12.pnl, 4),
     recent12WinRate: round(recent12.winRate * 100, 2),
     portfolioPnl: round(portfolio.pnl, 4),
+    portfolioCapUsdc,
+    portfolioCommittedUsdc: commitment.total,
+    portfolioOtherCommittedUsdc: commitment.other,
+    portfolioAvailableForLegUsdc: round(availableForLeg, 2),
   };
   Object.assign(adjustments, {
     smallBankrollMode: cfg.smallBankrollMode,
@@ -2695,12 +4334,39 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
     orderTtlSec: cfg.orderTtlSec,
     minFillPrice: cfg.minFillPrice,
     smallBankrollMakerOnly: cfg.smallBankrollMakerOnly,
+    smallBankrollFallbackFillEnabled: cfg.smallBankrollFallbackFillEnabled,
+    smallBankrollFallbackSyntheticDepthUsdc: cfg.smallBankrollFallbackSyntheticDepthUsdc,
+    smallBankrollFallbackCrossMaxAsk: cfg.smallBankrollFallbackCrossMaxAsk,
+    smallBankrollFallbackMaxSpread: cfg.smallBankrollFallbackMaxSpread,
+    smallBankrollSignalFallbackEnabled: cfg.smallBankrollSignalFallbackEnabled,
+    smallBankrollSignalFallbackMinBps: cfg.smallBankrollSignalFallbackMinBps,
+    smallBankrollSignalFallbackMaxAsk: cfg.smallBankrollSignalFallbackMaxAsk,
+    smallBankrollSignalFallbackMaxVelocityOpposeBps: cfg.smallBankrollSignalFallbackMaxVelocityOpposeBps,
+    takerSnapshotFillGraceSec: cfg.takerSnapshotFillGraceSec,
+    windowParticipationScoutEnabled: cfg.windowParticipationScoutEnabled,
+    windowParticipationTargetRows: cfg.windowParticipationTargetRows,
+    windowParticipationScoutOrderUsdc: cfg.windowParticipationScoutOrderUsdc,
+    windowParticipationMakerMaxAsk: cfg.windowParticipationMakerMaxAsk,
+    windowParticipationCrossMaxAsk: cfg.windowParticipationCrossMaxAsk,
+    windowParticipationCrossAfterSec: cfg.windowParticipationCrossAfterSec,
+    windowParticipationMinRemainingSec: cfg.windowParticipationMinRemainingSec,
+    windowParticipationMaxLocalOpposeBps: cfg.windowParticipationMaxLocalOpposeBps,
+    windowParticipationMaxEdgeDebt: cfg.windowParticipationMaxEdgeDebt,
+    tailRiskScoutEnabled: cfg.tailRiskScoutEnabled,
+    tailRiskScoutOrderUsdc: cfg.tailRiskScoutOrderUsdc,
+    tailRiskScoutMaxPerCycle: cfg.tailRiskScoutMaxPerCycle,
+    tailRiskScoutFavoriteMinAsk: cfg.tailRiskScoutFavoriteMinAsk,
+    tailRiskScoutMaxAsk: cfg.tailRiskScoutMaxAsk,
+    tailRiskScoutCrossMaxAsk: cfg.tailRiskScoutCrossMaxAsk,
+    tailRiskScoutMinSignalBps: cfg.tailRiskScoutMinSignalBps,
+    tailRiskScoutMinRemainingSec: cfg.tailRiskScoutMinRemainingSec,
     riskTrancheEnabled: cfg.riskTrancheEnabled,
     exitEnabled: cfg.exitEnabled,
     exitFlipBps: cfg.exitFlipBps,
     exitStopLossPct: cfg.exitStopLossPct,
     exitBeforeEndSec: cfg.exitBeforeEndSec,
     initialBudgetFraction: cfg.initialBudgetFraction,
+    strongBudgetFraction: cfg.strongBudgetFraction,
     profitBudgetFraction: cfg.profitBudgetFraction,
     adverseBudgetFraction: cfg.adverseBudgetFraction,
     windowLossStopUsdc: cfg.windowLossStopUsdc,
@@ -2708,8 +4374,8 @@ function applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions)
     maxOrdersPerWindow: cfg.maxOrdersPerWindow,
   });
   suggestions.push("50U guardian disables learned-probe entries; Bonereaper flow is diagnostic only");
-  if (cfg.smallBankrollMakerOnly) suggestions.push("50U safe-frequency mode: weak signals use maker-only 1U probes; crossing needs high confidence");
-  suggestions.push(`50U safe-frequency ${mode}: ${legKey} rows ${cfg.targetOrderRows}, budget ${cfg.budgetUsdc}U, loss stop ${cfg.windowLossStopUsdc}U, recent6 pnl ${round(recent6.pnl, 2)}U`);
+  if (cfg.smallBankrollMakerOnly) suggestions.push("50U fill-aware mode: weak 15m signals use maker-only 5U probes; crossing needs scale mode");
+  suggestions.push(`50U fill-aware ${mode}: ${legKey} rows ${cfg.targetOrderRows}, budget ${cfg.budgetUsdc}U, portfolio cap ${portfolioCapUsdc}U, committed ${round(commitment.total, 2)}U, loss stop ${cfg.windowLossStopUsdc}U, fallback cross cap ${cfg.smallBankrollFallbackCrossMaxAsk}, recent6 pnl ${round(recent6.pnl, 2)}U`);
 }
 
 function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
@@ -2744,11 +4410,12 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
   const qualityDirection12 = directionStats(qualityLegRows.slice(0, 12));
 
   const is15m = leg.horizon === "15m";
+  const is5m = !is15m;
   const isEth = leg.asset === "ETH";
   const profile = {
     BTC5m: { budget: 7, scaleBudget: 12, rescueBudget: 2, targetRows: 8, scaleRows: 14, clip: 1.4, scaleClip: 2, minEdge: 0.04, minSignal: 4.2, maxAsk: 0.84, highAsk: 0.9, minDepth: 4, participation: 0.12 },
     BTC15m: { budget: 44, scaleBudget: 70, rescueBudget: 10, targetRows: 34, scaleRows: 58, clip: 2.2, scaleClip: 3.2, minEdge: 0.036, minSignal: 3.6, maxAsk: 0.88, highAsk: 0.93, minDepth: 5.5, participation: 0.16 },
-    ETH5m: { budget: 4, scaleBudget: 6, rescueBudget: 1, targetRows: 4, scaleRows: 6, clip: 1.1, scaleClip: 1.5, minEdge: 0.06, minSignal: 5.8, maxAsk: 0.8, highAsk: 0.86, minDepth: 5, participation: 0.08 },
+    ETH5m: { budget: 5, scaleBudget: 7.5, rescueBudget: 5, targetRows: 4, scaleRows: 6, clip: 5, scaleClip: 5, minEdge: 0.06, minSignal: 5.8, maxAsk: 0.8, highAsk: 0.86, minDepth: 5, participation: 0.1 },
     ETH15m: { budget: 26, scaleBudget: 42, rescueBudget: 6, targetRows: 18, scaleRows: 32, clip: 1.8, scaleClip: 2.6, minEdge: 0.046, minSignal: 4.2, maxAsk: 0.86, highAsk: 0.9, minDepth: 5.5, participation: 0.12 },
   }[legKey];
   if (!profile) return;
@@ -2783,6 +4450,11 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
   const medianWindowUsdc = num(learner.medianWindowBuyUsdc);
   const medianBuyUsdc = num(learner.medianBuyUsdc, NaN);
   const learnedPreferred = learner.preferredOutcome || "";
+  const learnedSecondary = learner.secondaryOutcome || (learnedPreferred === "Up" ? "Down" : learnedPreferred === "Down" ? "Up" : "");
+  const secondaryRows = learnedSecondary ? num(learner.byOutcome?.[learnedSecondary]?.rows, num(learner.secondaryRows)) : 0;
+  const secondaryUsdc = learnedSecondary ? num(learner.byOutcome?.[learnedSecondary]?.usdc, num(learner.secondaryUsdc)) : 0;
+  const secondaryShare = Math.max(num(learner.secondaryShare), num(learner.medianMinorShare, 0));
+  const historicalBothRate = num(learner.bilateralWindowRate);
   const learnedActive = observedRows > 0 && learnedPreferred;
   const flowLearningHot = Boolean(learnedActive && (
     recentFlowRows >= (is15m ? 2 : 1)
@@ -2828,12 +4500,21 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
     || lossAsymmetryHot
     || currentAdverseHot
     || currentUnrealized < -Math.max(4, profile.budget * (isEth ? 0.18 : 0.12));
-  const fifteenMinuteScoutEligible = false;
+  const fifteenMinuteScoutEligible = Boolean(
+    is15m
+    && !scoutHardBlock
+    && !qualityGate
+    && (
+      quality12.rows < 6
+      || qualityDirection12.hitRate >= 0.5
+      || flowLearningHot
+    )
+  );
 
   if (hardRisk) {
     mode = "defensive";
-    budget = Math.max(POLYMARKET_MIN_ORDER_USDC, profile.rescueBudget);
-    targetRows = is15m ? Math.max(4, Math.floor(profile.targetRows * 0.22)) : Math.max(1, Math.floor(profile.targetRows * 0.35));
+    budget = Math.max(POLYMARKET_MIN_ORDER_USDC, profile.rescueBudget, is5m ? 10 : 0);
+    targetRows = is15m ? Math.max(4, Math.floor(profile.targetRows * 0.22)) : Math.max(2, Math.floor(profile.targetRows * 0.45));
     maxClip = Math.max(POLYMARKET_MIN_ORDER_USDC, Math.min(profile.clip * 0.45, isEth ? 1.4 : 1.3));
     minEdge = profile.minEdge + (isEth ? 0.025 : 0.026);
     minSignal = profile.minSignal + (isEth ? 1.8 : 1.7);
@@ -2958,6 +4639,15 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
   cfg.directionMaxBookOpposeBps = round(isEth ? 1.1 : 1.4, 3);
   cfg.maxAsk = round(Math.min(num(cfg.maxAsk), maxAsk), 3);
   cfg.highConfidenceMaxAsk = round(Math.max(num(cfg.maxAsk), profile.highAsk || maxAsk), 3);
+  cfg.takerLimitBufferCents = round(
+    mode === "defensive"
+      ? (is15m ? 0.015 : 0.01)
+      : is15m
+      ? (isEth ? 0.025 : 0.03)
+      : (isEth ? 0.018 : 0.022),
+    3,
+  );
+  cfg.takerSnapshotFillGraceSec = round(is15m ? 2.8 : 1.8, 2);
   cfg.minVisibleDepthUsdc = round(Math.max(num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC), minDepth), 3);
   cfg.liquidityParticipation = round(Math.min(num(cfg.liquidityParticipation, 0.35), participation), 3);
   cfg.minFillPrice = round(Math.max(num(cfg.minFillPrice, 0.01), isEth ? 0.1 : 0.08), 3);
@@ -2970,13 +4660,18 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
   cfg.flowConfirmOpeningRowRatio = is15m ? 0.5 : 0.65;
   cfg.flowConfirmMaxOpposingParentBps = isEth ? 4.5 : 5.5;
   cfg.flowConfirmMinEdge = round(is15m ? -0.004 : 0.002, 4);
-  cfg.qualityScoutEnabled = Boolean(qualityScaleActive && !is15m);
-  cfg.qualityScoutOrderUsdc = round(Math.max(POLYMARKET_MIN_ORDER_USDC, cfg.probeOrderUsdc), 2);
-  cfg.qualityScoutMaxPerCycle = Math.max(2, Math.min(18, Math.floor(targetRows * 0.22)));
-  cfg.qualityScoutRelaxDirectionGate = false;
-  cfg.qualityScoutMinFairGap = round(isEth ? 0.04 : 0.035, 4);
-  cfg.qualityScoutMaxVelocityOpposeBps = round(isEth ? 0.65 : 0.8, 3);
-  cfg.qualityScoutNeedsFlow = false;
+  cfg.qualityScoutEnabled = Boolean((qualityScaleActive && !is15m) || fifteenMinuteScoutEligible);
+  cfg.qualityScoutOrderUsdc = round(
+    fifteenMinuteScoutEligible
+      ? POLYMARKET_MIN_ORDER_USDC
+      : Math.max(POLYMARKET_MIN_ORDER_USDC, cfg.probeOrderUsdc),
+    2,
+  );
+  cfg.qualityScoutMaxPerCycle = fifteenMinuteScoutEligible ? (isEth ? 2 : 3) : Math.max(2, Math.min(18, Math.floor(targetRows * 0.22)));
+  cfg.qualityScoutRelaxDirectionGate = fifteenMinuteScoutEligible;
+  cfg.qualityScoutMinFairGap = round(fifteenMinuteScoutEligible ? (isEth ? 0.028 : 0.024) : (isEth ? 0.04 : 0.035), 4);
+  cfg.qualityScoutMaxVelocityOpposeBps = round(fifteenMinuteScoutEligible ? (isEth ? 0.9 : 1.1) : (isEth ? 0.65 : 0.8), 3);
+  cfg.qualityScoutNeedsFlow = fifteenMinuteScoutEligible;
   cfg.qualityScoutMinSignalBps = round(
     fifteenMinuteScoutEligible
       ? Math.max(isEth ? 3.4 : 3.0, minSignal - (isEth ? 0.65 : 0.75))
@@ -2985,7 +4680,24 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
   );
   cfg.qualityScoutMaxParentOpposeBps = round(isEth ? 6 : 7.5, 3);
   cfg.qualityScoutMakerOnly = true;
-  const learningScoutEligible = false;
+  cfg.fifteenMinuteTouchScoutEnabled = Boolean(is15m && !scoutHardBlock && (fifteenMinuteScoutEligible || flowLearningHot || qualityGate));
+  cfg.fifteenMinuteTouchScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
+  cfg.fifteenMinuteTouchScoutMaxPerCycle = cfg.fifteenMinuteTouchScoutEnabled
+    ? (isEth ? 2 : 3)
+    : 0;
+  cfg.fifteenMinuteTouchScoutMinSignalBps = round(isEth ? 3.4 : 3.0, 3);
+  cfg.fifteenMinuteTouchScoutMaxAsk = round(isEth ? 0.9 : 0.93, 3);
+  cfg.fifteenMinuteTouchScoutMaxEdgeDebt = round(isEth ? 0.075 : 0.095, 3);
+  const learningScoutEligible = Boolean(
+    learnedActive
+    && !scoutHardBlock
+    && (
+      flowLearningHot
+      || recentFlowRows > 0
+      || observedRows >= (is15m ? 3 : 6)
+      || observedUsdc >= (is15m ? 12 : 25)
+    )
+  );
   cfg.liveLearningScoutEnabled = learningScoutEligible;
   cfg.liveLearningScoutMakerOnly = true;
   cfg.liveLearningScoutOrderUsdc = POLYMARKET_MIN_ORDER_USDC;
@@ -2999,6 +4711,118 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
   cfg.liveLearningScoutMaxLocalOpposeBps = round(isEth ? (is15m ? 3.5 : 2.8) : (is15m ? 5.5 : 4.2), 3);
   cfg.liveLearningScoutMaxParentOpposeBps = round(isEth ? 4.5 : 5.5, 3);
   cfg.liveLearningScoutMinEdge = round(isEth ? 0.004 : 0.002, 4);
+  const flowTouchScoutEligible = Boolean(flowLearningHot && !scoutHardBlock && observedRows >= (is15m ? 3 : 8));
+  cfg.spreadMakerChildrenAcrossLevels = true;
+  cfg.flowTouchScoutEnabled = flowTouchScoutEligible;
+  cfg.flowTouchScoutOrderUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC), isEth ? POLYMARKET_MIN_ORDER_USDC : (is15m ? 12 : 10)),
+  ), 2);
+  cfg.flowTouchScoutMaxPerCycle = flowTouchScoutEligible
+    ? (is15m ? (isEth ? 3 : 5) : (isEth ? 2 : 8))
+    : 0;
+  cfg.flowTouchScoutMaxEdgeDebt = round(is15m ? (isEth ? 0.11 : 0.13) : (isEth ? 0.14 : 0.18), 3);
+  const tailRiskScoutEligible = Boolean(!scoutHardBlock && (flowLearningHot || burstPeak >= 3 || observedRows >= (is15m ? 8 : 20)));
+  const bilateralInventoryLearningHot = Boolean(
+    !scoutHardBlock
+    && learnedPreferred
+    && learnedSecondary
+    && (
+      secondaryRows > 0
+      || secondaryUsdc >= POLYMARKET_MIN_ORDER_USDC
+      || (historicalBothRate >= (is15m ? 0.55 : 0.62) && (observedRows >= (is15m ? 2 : 4) || observedUsdc >= (is15m ? 10 : 18) || flowLearningHot))
+    )
+  );
+  cfg.tailRiskScoutEnabled = tailRiskScoutEligible;
+  cfg.tailRiskScoutOrderUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC), isEth ? POLYMARKET_MIN_ORDER_USDC : (is15m ? 8 : 10)),
+  ), 2);
+  cfg.tailRiskScoutMaxPerCycle = tailRiskScoutEligible
+    ? (is15m ? (isEth ? 1 : 2) : (isEth ? 1 : 3))
+    : 0;
+  cfg.tailRiskScoutFavoriteMinAsk = round(is15m ? 0.92 : 0.94, 3);
+  cfg.tailRiskScoutMaxAsk = round(isEth ? 0.05 : (is15m ? 0.07 : 0.06), 3);
+  cfg.tailRiskScoutCrossMaxAsk = round(isEth ? 0.025 : 0.035, 3);
+  cfg.tailRiskScoutMinSignalBps = round(isEth ? (is15m ? 4.5 : 5.5) : (is15m ? 3.8 : 4.2), 3);
+  cfg.bilateralInventoryScoutEnabled = bilateralInventoryLearningHot;
+  cfg.bilateralInventoryAnchorOutcome = learnedPreferred;
+  cfg.bilateralInventoryScoutOutcome = learnedSecondary;
+  cfg.bilateralInventoryScoutOrderUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC), isEth ? POLYMARKET_MIN_ORDER_USDC : (is15m ? 8 : 10)),
+  ), 2);
+  cfg.bilateralInventoryScoutMaxPerCycle = bilateralInventoryLearningHot
+    ? (is15m ? (isEth ? 2 : 4) : (isEth ? 2 : 6))
+    : 0;
+  cfg.bilateralInventoryMaxAsk = round(isEth ? (is15m ? 0.84 : 0.78) : (is15m ? 0.88 : 0.86), 3);
+  cfg.bilateralInventoryCrossMaxAsk = round(isEth ? 0.045 : (is15m ? 0.065 : 0.055), 3);
+  cfg.bilateralInventoryMaxEdgeDebt = round(isEth ? (is15m ? 0.105 : 0.13) : (is15m ? 0.12 : 0.16), 3);
+  cfg.bilateralInventoryTargetMinorShare = round(clamp(Math.max(secondaryShare, is15m ? 0.16 : 0.12), 0.08, isEth ? 0.28 : 0.34), 3);
+  cfg.bilateralInventoryMinRows = is15m ? (isEth ? 2 : 3) : (isEth ? 4 : 6);
+  cfg.bilateralInventoryMinUsdc = round(is15m ? (isEth ? 5 : 12) : (isEth ? 12 : 25), 2);
+  cfg.inventoryRebalanceRatio = bilateralInventoryLearningHot ? (is15m ? (isEth ? 0.22 : 0.28) : (isEth ? 0.18 : 0.24)) : cfg.inventoryRebalanceRatio;
+  cfg.windowParticipationScoutEnabled = !scoutHardBlock;
+  cfg.windowParticipationScoutOrderUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC), isEth ? POLYMARKET_MIN_ORDER_USDC : (is15m ? 10 : 8)),
+  ), 2);
+  const densityFloorRows = is15m ? (isEth ? 18 : 42) : (isEth ? 10 : 24);
+  const densityCapRows = is15m ? (isEth ? 90 : 180) : (isEth ? 48 : 110);
+  const learnedDensityRows = Math.max(
+    num(learner.suggested?.targetOrderRows, 0) * (is15m ? 0.7 : 0.55),
+    num(learner.p75WindowBuyRows, 0) * (is15m ? 0.65 : 0.5),
+    observedRows * (is15m ? 0.7 : 0.55),
+    recentFlowRows * (is15m ? 10 : 7),
+    burstPeak * (is15m ? 18 : 12),
+  );
+  cfg.windowParticipationTargetRows = Math.round(clamp(Math.max(densityFloorRows, learnedDensityRows), densityFloorRows, densityCapRows));
+  cfg.windowParticipationScoutMaxPerCycle = Math.max(
+    is15m ? (isEth ? 5 : 9) : (isEth ? 4 : 7),
+    Math.min(is15m ? 18 : 14, Math.ceil(cfg.windowParticipationTargetRows * (is15m ? 0.12 : 0.16))),
+  );
+  cfg.windowParticipationMakerMaxAsk = round(isEth ? (is15m ? 0.97 : 0.95) : (is15m ? 0.98 : 0.97), 3);
+  cfg.windowParticipationCrossMaxAsk = round(isEth ? (is15m ? 0.92 : 0.9) : (is15m ? 0.95 : 0.93), 3);
+  cfg.windowParticipationCrossAfterSec = is15m ? (isEth ? 70 : 55) : (isEth ? 18 : 10);
+  cfg.windowParticipationFirstCrossEnabled = !scoutHardBlock;
+  cfg.windowParticipationFirstCrossRows = is15m ? (isEth ? 3 : 5) : (isEth ? 4 : 8);
+  cfg.windowParticipationFirstCrossMinRemainingSec = is15m ? 150 : 45;
+  cfg.windowParticipationCheapCrossMaxAsk = round(isEth ? (is15m ? 0.16 : 0.18) : (is15m ? 0.18 : 0.24), 3);
+  cfg.windowParticipationMaxEdgeDebt = round(isEth ? (is15m ? 0.24 : 0.28) : (is15m ? 0.26 : 0.32), 3);
+  cfg.windowParticipationMaxLocalOpposeBps = round(isEth ? (is15m ? 8 : 10) : (is15m ? 9 : 12), 3);
+  cfg.windowParticipationMinRemainingSec = is15m ? 45 : 6;
+  const densityBudgetFloor = Math.max(
+    num(cfg.budgetUsdc, 0),
+    cfg.windowParticipationTargetRows * POLYMARKET_MIN_ORDER_USDC * (is15m ? (isEth ? 0.5 : 0.42) : (isEth ? 0.42 : 0.34)),
+  );
+  cfg.budgetUsdc = round(Math.min(1000, densityBudgetFloor), 2);
+  cfg.maxDirectionExposureUsdc = round(Math.min(1000, Math.max(num(cfg.maxDirectionExposureUsdc, 0), cfg.budgetUsdc * (is15m ? 0.62 : 0.55))), 2);
+  cfg.targetOrderRows = Math.max(num(cfg.targetOrderRows, 0), cfg.windowParticipationTargetRows);
+  cfg.maxOrdersPerWindow = cfg.targetOrderRows;
+  cfg.parentSafetyScoutEnabled = Boolean(!is15m && !scoutHardBlock);
+  cfg.parentSafetyScoutOrderUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC), isEth ? POLYMARKET_MIN_ORDER_USDC : 10),
+  ), 2);
+  cfg.parentSafetyScoutMaxPerCycle = cfg.parentSafetyScoutEnabled ? (isEth ? 2 : 6) : 0;
+  cfg.parentSafetyScoutMaxAsk = round(isEth ? 0.82 : 0.88, 3);
+  cfg.parentSafetyScoutMinParentBps = round(isEth ? 5.5 : 5, 3);
+  cfg.parentSafetyScoutMaxLocalOpposeBps = round(isEth ? 9 : 14, 3);
+  cfg.parentSafetyScoutMaxEdgeDebt = round(isEth ? 0.1 : 0.08, 3);
+  cfg.confidenceCrossScoutEnabled = Boolean(!scoutHardBlock && (
+    qualityGate
+    || (is15m && (flowLearningHot || fifteenMinuteScoutEligible || qualityDirection12.hitRate >= 0.5))
+  ));
+  cfg.confidenceCrossScoutOrderUsdc = round(Math.max(
+    POLYMARKET_MIN_ORDER_USDC,
+    Math.min(num(cfg.maxClipUsdc, POLYMARKET_MIN_ORDER_USDC), isEth ? POLYMARKET_MIN_ORDER_USDC : 10),
+  ), 2);
+  cfg.confidenceCrossScoutMaxPerCycle = cfg.confidenceCrossScoutEnabled
+    ? (is15m ? (isEth ? 2 : 3) : (isEth ? 2 : 4))
+    : 0;
+  cfg.confidenceCrossScoutMinSignalBps = round(is15m ? (isEth ? 9.5 : 8.5) : (isEth ? 12 : 10), 3);
+  cfg.confidenceCrossScoutMaxAsk = round(is15m ? (isEth ? 0.88 : 0.93) : (isEth ? 0.86 : 0.92), 3);
+  cfg.confidenceCrossScoutMaxEdgeDebt = round(is15m ? (isEth ? 0.025 : 0.035) : (isEth ? 0.035 : 0.05), 3);
   cfg.observedPreferredOutcome = learnedPreferred;
   cfg.observedMedianBuyUsdc = Number.isFinite(medianBuyUsdc) ? round(medianBuyUsdc, 6) : null;
   cfg.observedWindowBuyUsdc = round(observedUsdc, 6);
@@ -3046,6 +4870,57 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
     liveLearningScoutMinRows: cfg.liveLearningScoutMinRows,
     liveLearningScoutMinUsdc: cfg.liveLearningScoutMinUsdc,
     liveLearningScoutMaxAgeSec: cfg.liveLearningScoutMaxAgeSec,
+    spreadMakerChildrenAcrossLevels: cfg.spreadMakerChildrenAcrossLevels,
+    flowTouchScoutEnabled: cfg.flowTouchScoutEnabled,
+    flowTouchScoutOrderUsdc: cfg.flowTouchScoutOrderUsdc,
+    flowTouchScoutMaxPerCycle: cfg.flowTouchScoutMaxPerCycle,
+    flowTouchScoutMaxEdgeDebt: cfg.flowTouchScoutMaxEdgeDebt,
+    tailRiskScoutEnabled: cfg.tailRiskScoutEnabled,
+    tailRiskScoutOrderUsdc: cfg.tailRiskScoutOrderUsdc,
+    tailRiskScoutMaxPerCycle: cfg.tailRiskScoutMaxPerCycle,
+    tailRiskScoutFavoriteMinAsk: cfg.tailRiskScoutFavoriteMinAsk,
+    tailRiskScoutMaxAsk: cfg.tailRiskScoutMaxAsk,
+    tailRiskScoutCrossMaxAsk: cfg.tailRiskScoutCrossMaxAsk,
+    bilateralInventoryScoutEnabled: cfg.bilateralInventoryScoutEnabled,
+    bilateralInventoryAnchorOutcome: cfg.bilateralInventoryAnchorOutcome,
+    bilateralInventoryScoutOutcome: cfg.bilateralInventoryScoutOutcome,
+    bilateralInventoryScoutOrderUsdc: cfg.bilateralInventoryScoutOrderUsdc,
+    bilateralInventoryScoutMaxPerCycle: cfg.bilateralInventoryScoutMaxPerCycle,
+    bilateralInventoryMaxAsk: cfg.bilateralInventoryMaxAsk,
+    bilateralInventoryCrossMaxAsk: cfg.bilateralInventoryCrossMaxAsk,
+    bilateralInventoryMaxEdgeDebt: cfg.bilateralInventoryMaxEdgeDebt,
+    bilateralInventoryTargetMinorShare: cfg.bilateralInventoryTargetMinorShare,
+    bilateralWindowRate: round(historicalBothRate * 100, 2),
+    observedSecondaryRows: secondaryRows,
+    observedSecondaryUsdc: round(secondaryUsdc, 4),
+    observedSecondaryShare: round(secondaryShare * 100, 2),
+    windowParticipationScoutEnabled: cfg.windowParticipationScoutEnabled,
+    windowParticipationTargetRows: cfg.windowParticipationTargetRows,
+    windowParticipationScoutOrderUsdc: cfg.windowParticipationScoutOrderUsdc,
+    windowParticipationScoutMaxPerCycle: cfg.windowParticipationScoutMaxPerCycle,
+    windowParticipationMakerMaxAsk: cfg.windowParticipationMakerMaxAsk,
+    windowParticipationCrossMaxAsk: cfg.windowParticipationCrossMaxAsk,
+    windowParticipationCrossAfterSec: cfg.windowParticipationCrossAfterSec,
+    windowParticipationFirstCrossEnabled: cfg.windowParticipationFirstCrossEnabled,
+    windowParticipationFirstCrossRows: cfg.windowParticipationFirstCrossRows,
+    windowParticipationFirstCrossMinRemainingSec: cfg.windowParticipationFirstCrossMinRemainingSec,
+    windowParticipationCheapCrossMaxAsk: cfg.windowParticipationCheapCrossMaxAsk,
+    windowParticipationMaxEdgeDebt: cfg.windowParticipationMaxEdgeDebt,
+    parentSafetyScoutEnabled: cfg.parentSafetyScoutEnabled,
+    parentSafetyScoutOrderUsdc: cfg.parentSafetyScoutOrderUsdc,
+    parentSafetyScoutMaxPerCycle: cfg.parentSafetyScoutMaxPerCycle,
+    parentSafetyScoutMaxAsk: cfg.parentSafetyScoutMaxAsk,
+    parentSafetyScoutMinParentBps: cfg.parentSafetyScoutMinParentBps,
+    parentSafetyScoutMaxLocalOpposeBps: cfg.parentSafetyScoutMaxLocalOpposeBps,
+    parentSafetyScoutMaxEdgeDebt: cfg.parentSafetyScoutMaxEdgeDebt,
+    confidenceCrossScoutEnabled: cfg.confidenceCrossScoutEnabled,
+    confidenceCrossScoutOrderUsdc: cfg.confidenceCrossScoutOrderUsdc,
+    confidenceCrossScoutMaxPerCycle: cfg.confidenceCrossScoutMaxPerCycle,
+    confidenceCrossScoutMinSignalBps: cfg.confidenceCrossScoutMinSignalBps,
+    confidenceCrossScoutMaxAsk: cfg.confidenceCrossScoutMaxAsk,
+    confidenceCrossScoutMaxEdgeDebt: cfg.confidenceCrossScoutMaxEdgeDebt,
+    takerLimitBufferCents: cfg.takerLimitBufferCents,
+    takerSnapshotFillGraceSec: cfg.takerSnapshotFillGraceSec,
     recent24AvgWinPnl: round(avgWinPnl, 4),
     recent24AvgLossAbs: round(avgLossAbs, 4),
     lossAsymmetryHot,
@@ -3106,6 +4981,57 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
     liveLearningScoutMaxLocalOpposeBps: cfg.liveLearningScoutMaxLocalOpposeBps,
     liveLearningScoutMaxParentOpposeBps: cfg.liveLearningScoutMaxParentOpposeBps,
     liveLearningScoutMinEdge: cfg.liveLearningScoutMinEdge,
+    spreadMakerChildrenAcrossLevels: cfg.spreadMakerChildrenAcrossLevels,
+    flowTouchScoutEnabled: cfg.flowTouchScoutEnabled,
+    flowTouchScoutOrderUsdc: cfg.flowTouchScoutOrderUsdc,
+    flowTouchScoutMaxPerCycle: cfg.flowTouchScoutMaxPerCycle,
+    flowTouchScoutMaxEdgeDebt: cfg.flowTouchScoutMaxEdgeDebt,
+    tailRiskScoutEnabled: cfg.tailRiskScoutEnabled,
+    tailRiskScoutOrderUsdc: cfg.tailRiskScoutOrderUsdc,
+    tailRiskScoutMaxPerCycle: cfg.tailRiskScoutMaxPerCycle,
+    tailRiskScoutFavoriteMinAsk: cfg.tailRiskScoutFavoriteMinAsk,
+    tailRiskScoutMaxAsk: cfg.tailRiskScoutMaxAsk,
+    tailRiskScoutCrossMaxAsk: cfg.tailRiskScoutCrossMaxAsk,
+    bilateralInventoryScoutEnabled: cfg.bilateralInventoryScoutEnabled,
+    bilateralInventoryAnchorOutcome: cfg.bilateralInventoryAnchorOutcome,
+    bilateralInventoryScoutOutcome: cfg.bilateralInventoryScoutOutcome,
+    bilateralInventoryScoutOrderUsdc: cfg.bilateralInventoryScoutOrderUsdc,
+    bilateralInventoryScoutMaxPerCycle: cfg.bilateralInventoryScoutMaxPerCycle,
+    bilateralInventoryMaxAsk: cfg.bilateralInventoryMaxAsk,
+    bilateralInventoryCrossMaxAsk: cfg.bilateralInventoryCrossMaxAsk,
+    bilateralInventoryMaxEdgeDebt: cfg.bilateralInventoryMaxEdgeDebt,
+    bilateralInventoryTargetMinorShare: cfg.bilateralInventoryTargetMinorShare,
+    bilateralInventoryMinRows: cfg.bilateralInventoryMinRows,
+    bilateralInventoryMinUsdc: cfg.bilateralInventoryMinUsdc,
+    windowParticipationScoutEnabled: cfg.windowParticipationScoutEnabled,
+    windowParticipationTargetRows: cfg.windowParticipationTargetRows,
+    windowParticipationScoutOrderUsdc: cfg.windowParticipationScoutOrderUsdc,
+    windowParticipationScoutMaxPerCycle: cfg.windowParticipationScoutMaxPerCycle,
+    windowParticipationMakerMaxAsk: cfg.windowParticipationMakerMaxAsk,
+    windowParticipationCrossMaxAsk: cfg.windowParticipationCrossMaxAsk,
+    windowParticipationCrossAfterSec: cfg.windowParticipationCrossAfterSec,
+    windowParticipationFirstCrossEnabled: cfg.windowParticipationFirstCrossEnabled,
+    windowParticipationFirstCrossRows: cfg.windowParticipationFirstCrossRows,
+    windowParticipationFirstCrossMinRemainingSec: cfg.windowParticipationFirstCrossMinRemainingSec,
+    windowParticipationCheapCrossMaxAsk: cfg.windowParticipationCheapCrossMaxAsk,
+    windowParticipationMaxEdgeDebt: cfg.windowParticipationMaxEdgeDebt,
+    windowParticipationMaxLocalOpposeBps: cfg.windowParticipationMaxLocalOpposeBps,
+    windowParticipationMinRemainingSec: cfg.windowParticipationMinRemainingSec,
+    parentSafetyScoutEnabled: cfg.parentSafetyScoutEnabled,
+    parentSafetyScoutOrderUsdc: cfg.parentSafetyScoutOrderUsdc,
+    parentSafetyScoutMaxPerCycle: cfg.parentSafetyScoutMaxPerCycle,
+    parentSafetyScoutMaxAsk: cfg.parentSafetyScoutMaxAsk,
+    parentSafetyScoutMinParentBps: cfg.parentSafetyScoutMinParentBps,
+    parentSafetyScoutMaxLocalOpposeBps: cfg.parentSafetyScoutMaxLocalOpposeBps,
+    parentSafetyScoutMaxEdgeDebt: cfg.parentSafetyScoutMaxEdgeDebt,
+    confidenceCrossScoutEnabled: cfg.confidenceCrossScoutEnabled,
+    confidenceCrossScoutOrderUsdc: cfg.confidenceCrossScoutOrderUsdc,
+    confidenceCrossScoutMaxPerCycle: cfg.confidenceCrossScoutMaxPerCycle,
+    confidenceCrossScoutMinSignalBps: cfg.confidenceCrossScoutMinSignalBps,
+    confidenceCrossScoutMaxAsk: cfg.confidenceCrossScoutMaxAsk,
+    confidenceCrossScoutMaxEdgeDebt: cfg.confidenceCrossScoutMaxEdgeDebt,
+    takerLimitBufferCents: cfg.takerLimitBufferCents,
+    takerSnapshotFillGraceSec: cfg.takerSnapshotFillGraceSec,
     probeEnabled: cfg.probeEnabled,
     probeMaxPerCycle: cfg.probeMaxPerCycle,
     inventoryRebalanceRatio: cfg.inventoryRebalanceRatio,
@@ -3145,7 +5071,7 @@ function applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions) {
     exitStopLossPct: cfg.exitStopLossPct,
     exitBeforeEndSec: cfg.exitBeforeEndSec,
   });
-  suggestions.push(`learn-flow ${mode}: ${legKey} budget ${cfg.budgetUsdc}U, rows ${cfg.targetOrderRows}, quality ${round(quality12.winRate * 100, 1)}%/${round(qualityDirection12.hitRate * 100, 1)}%, Bonereaper flow ${flowLearningHot ? "active" : "watch"}, hold-to-settle with ${cfg.exitFlipBps}bps flip stop`);
+  suggestions.push(`v38 learn-flow ${mode}: ${legKey} budget ${cfg.budgetUsdc}U, rows ${cfg.targetOrderRows}, first-cross ${cfg.windowParticipationFirstCrossRows || 0} rows after ${cfg.windowParticipationCrossAfterSec || 0}s, quality ${round(quality12.winRate * 100, 1)}%/${round(qualityDirection12.hitRate * 100, 1)}%, Bonereaper flow ${flowLearningHot ? "active" : "watch"}, bilateral inventory ${cfg.bilateralInventoryScoutEnabled ? `${cfg.bilateralInventoryAnchorOutcome}/${cfg.bilateralInventoryScoutOutcome}` : "watch"}, hold-to-settle with ${cfg.exitFlipBps}bps flip stop`);
 }
 
 function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000)) {
@@ -3403,10 +5329,10 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
     });
     suggestions.push(isEth
       ? (isSmallBankroll
-        ? "ETH 5m 50U soft-parent mode: direction, edge, depth and 1U loss stop without hard parent blocking"
+        ? "ETH 5m 50U soft-parent mode: direction, edge, depth and 5U loss stop without hard parent blocking"
         : "ETH 5m tightened: stronger flow, parent, edge, depth and lower participation")
       : (isSmallBankroll
-        ? "BTC 5m 50U soft-parent mode: direction, edge, depth and 1U loss stop without hard parent blocking"
+        ? "BTC 5m 50U soft-parent mode: direction, edge, depth and 5U loss stop without hard parent blocking"
         : "5m flow-carry mode: parent-confirmed entries, fresh Bonereaper flow, or opening flow carry with reduced size"));
   } else if ((clone.asset || slugAsset(clone.market?.slug)) === "ETH") {
     cfg.flowConfirmEnabled = true;
@@ -3440,6 +5366,9 @@ function applyAdaptiveConfig(state, clone, nowSec = Math.floor(Date.now() / 1000
   applySmallBankrollGuardian(state, clone, cfg, adjustments, suggestions);
   applyLiveReadyGuard(state, clone, cfg, adjustments, suggestions);
   applyCloneLegCapConfig(clone, cfg, adjustments, suggestions);
+  applyBonereaperLearning5mGuard(clone, cfg, adjustments, suggestions);
+  applyStrictExecutionModel(clone, cfg, adjustments, suggestions);
+  applyLiveTradeReadinessGuard(state, clone, cfg, adjustments, suggestions);
   clone.config = cfg;
   clone.adaptive = {
     enabled,
@@ -3604,18 +5533,49 @@ function rebuildClonePositionsFromFills(fills) {
   return positions;
 }
 
-function fillOpenCloneOrders(clone, nowSec) {
+function fillOpenCloneOrders(clone, nowSec, options = {}) {
+  const nowMs = marketClockNowMs(clone);
+  const cfg = clone.config || {};
   for (const order of clone.orders || []) {
     if (!["OPEN", "PARTIAL"].includes(order.status)) continue;
     const quote = clone.orderbook?.[order.direction];
-    if (nowSec - num(order.ts) > clone.config.orderTtlSec) {
+    const snapshotMs = num(order.snapshotMs, NaN);
+    const ageMs = Number.isFinite(snapshotMs)
+      ? Math.max(0, nowMs - snapshotMs)
+      : Math.max(0, (nowSec - num(order.ts)) * 1000);
+    const ageSec = ageMs / 1000;
+    const crossFakLike = crossFakLikeOrder(order, cfg);
+    if (crossFakLike && ageMs > crossFakMaxFillAgeMs(order, cfg)) {
       order.status = num(order.filledShares) > 0 ? "EXPIRED_PARTIAL" : "EXPIRED";
       order.updatedAt = isoFromSec(nowSec);
+      order.cancelReason = "cross FAK/IOC window expired without immediate depth";
+      markShadowLivePaperOrder(clone, order, order.status, { updatedAt: order.updatedAt, reason: order.cancelReason });
       continue;
     }
-    const fillLimit = cloneFillLimitPrice(order, quote, clone.config || {});
+    if (ageSec > cfg.orderTtlSec) {
+      order.status = num(order.filledShares) > 0 ? "EXPIRED_PARTIAL" : "EXPIRED";
+      order.updatedAt = isoFromSec(nowSec);
+      markShadowLivePaperOrder(clone, order, order.status, { updatedAt: order.updatedAt, reason: "paper order ttl expired" });
+      continue;
+    }
+    const fillLimit = cloneFillLimitPrice(order, quote, cfg);
+    const eligibleMs = num(order.eligibleFillMs, NaN);
+    const fillEligible = !Number.isFinite(eligibleMs) || nowMs >= eligibleMs;
+    if (crossFakLike && fillEligible) {
+      const marketable = Number.isFinite(quote?.ask) && Number.isFinite(fillLimit) && quote.ask <= fillLimit;
+      const filled = marketable ? tryFillCloneOrder(clone, order, nowSec, "cross FAK/IOC current ask", options) : false;
+      if (!filled && ["OPEN", "PARTIAL"].includes(order.status)) {
+        order.status = num(order.filledShares) > 0 ? "EXPIRED_PARTIAL" : "EXPIRED";
+        order.updatedAt = isoFromSec(nowSec);
+        order.cancelReason = marketable
+          ? "cross FAK/IOC insufficient immediate depth or stale book"
+          : "cross FAK/IOC current ask above limit";
+        markShadowLivePaperOrder(clone, order, order.status, { updatedAt: order.updatedAt, reason: order.cancelReason });
+      }
+      continue;
+    }
     if (Number.isFinite(quote?.ask) && Number.isFinite(fillLimit) && quote.ask <= fillLimit) {
-      tryFillCloneOrder(clone, order, nowSec, "limit crossed current ask");
+      tryFillCloneOrder(clone, order, nowSec, "limit crossed current ask", options);
     }
   }
 }
@@ -3625,16 +5585,21 @@ function cloneCandidateLevels(quote, cfg, isPreferred, strongMomentum, cheapHedg
   const ask = num(quote?.ask, NaN);
   const bid = num(quote?.bid, NaN);
   if (!Number.isFinite(ask)) return levels;
+  const tickSize = orderbookTickSize(quote);
+  const nearTick = tickSize <= 0.001 ? 0.001 : 0.01;
   levels.push({ style: "cross", limitPrice: takerLimitPrice(ask, cfg) });
   if (Number.isFinite(bid) && bid > 0 && bid < ask) levels.push({ style: "maker-ladder", limitPrice: round(bid, 2) });
   const makerTop = Number.isFinite(bid)
     ? round(clamp(bid + 0.01, 0.01, num(cfg.maxAsk, 0.99)), 2)
     : round(clamp(ask - 0.01, 0.01, num(cfg.maxAsk, 0.99)), 2);
   if (makerTop > 0 && makerTop < ask) levels.push({ style: "maker-ladder", limitPrice: makerTop });
-  const denseLadder = num(cfg.targetOrderRows) >= 40 || num(cfg.observedBurstPeak1s) >= 4 || num(cfg.observedRecentBuyRows30s) >= 6;
+  const denseLadder = num(cfg.targetOrderRows) >= 24
+    || num(cfg.observedWindowBuyRows) >= 12
+    || num(cfg.observedBurstPeak1s) >= 3
+    || num(cfg.observedRecentBuyRows30s) >= 2;
   const offsets = denseLadder
-    ? [0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1, 0.12, 0.15]
-    : ((isPreferred && strongMomentum) || cheapHedge ? [0.02, 0.03, 0.05] : [0.02]);
+    ? [nearTick, nearTick * 2, nearTick * 3, 0.02, 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1, 0.12, 0.15]
+    : ((isPreferred && strongMomentum) || cheapHedge ? [nearTick, nearTick * 2, 0.03, 0.05] : [nearTick, 0.02]);
   for (const offset of offsets) {
     const tick = num(quote?.tickSize, 0.01) <= 0.001 ? 3 : 2;
     const limitPrice = round(clamp(ask - offset, 0.01, num(cfg.maxAsk, 0.99)), tick);
@@ -3649,6 +5614,8 @@ function cloneFlowRetraceLevels(quote, cfg, clone, outcome, fairPrice) {
   const ask = num(quote?.ask, NaN);
   if (!Number.isFinite(ask)) return [];
   const tick = num(quote?.tickSize, 0.01) <= 0.001 ? 3 : 2;
+  const tickSize = orderbookTickSize(quote);
+  const nearTick = tickSize <= 0.001 ? 0.001 : 0.01;
   const cap = Math.min(num(cfg.maxAsk, 0.94), 0.97);
   const observedAvg = finiteNum(clone.learner?.byOutcome?.[outcome]?.avgPrice);
   const bid = finiteNum(quote?.bid);
@@ -3660,6 +5627,12 @@ function cloneFlowRetraceLevels(quote, cfg, clone, outcome, fairPrice) {
     fair,
   ].filter((value) => Number.isFinite(value) && value > 0);
   const levels = [];
+  for (const offset of [nearTick, nearTick * 2, nearTick * 3, 0.025, 0.04]) {
+    const limitPrice = round(clamp(ask - offset, 0.01, cap), tick);
+    if (limitPrice <= 0 || limitPrice >= ask || limitPrice > cap) continue;
+    if (levels.some((row) => Math.abs(row.limitPrice - limitPrice) < 0.000001)) continue;
+    levels.push({ style: "maker-ladder", limitPrice });
+  }
   for (const anchor of anchors) {
     for (const offset of [0, 0.02, 0.04, 0.06, 0.09]) {
       const limitPrice = round(clamp(anchor - offset, 0.01, cap), tick);
@@ -3690,6 +5663,14 @@ function cloneCandidateChildOrders(candidate, clone, elapsed) {
       ? Math.ceil(Math.max(1, observedRows / 14, burstRows * 2))
     : candidate.kind === "quality-scout"
       ? Math.ceil(Math.max(1, observedRows / 18, recentRows * 1.2, burstRows * 2))
+    : candidate.kind === "bilateral-inventory-scout"
+      ? Math.ceil(Math.max(1, observedRows / 18, recentRows * 1.4, burstRows * 1.8))
+    : candidate.kind === "window-participation-scout"
+      ? Math.ceil(Math.max(2, observedRows / 10, recentRows * 2.2, burstRows * 3, num(cfg.windowParticipationTargetRows, 0) / 18))
+    : candidate.kind === "parent-safety-scout"
+      ? Math.ceil(Math.max(2, observedRows / 16, recentRows * 1.5, burstRows * 2.5, num(cfg.windowParticipationFirstCrossRows, 0) / 3))
+    : candidate.kind === "confidence-cross-scout"
+      ? Math.ceil(Math.max(2, observedRows / 18, recentRows * 1.4, burstRows * 2.2, num(cfg.windowParticipationFirstCrossRows, 0) / 4))
     : candidate.kind === "directional"
       ? Math.ceil(Math.max(1, observedRows / 16, recentRows))
       : candidate.kind === "probe"
@@ -3705,8 +5686,21 @@ function cloneCandidateChildOrders(candidate, clone, elapsed) {
     ? Math.max(1, Math.floor(num(cfg.liveLearningScoutMaxPerCycle, 2)))
     : candidate.kind === "quality-scout"
       ? Math.max(1, Math.floor(num(cfg.qualityScoutMaxPerCycle, 2)))
+      : candidate.kind === "bilateral-inventory-scout"
+        ? Math.max(1, Math.floor(num(cfg.bilateralInventoryScoutMaxPerCycle, 2)))
+      : candidate.kind === "window-participation-scout"
+        ? Math.max(2, Math.floor(num(cfg.windowParticipationScoutMaxPerCycle, 4)))
+      : candidate.kind === "flow-touch-scout"
+        ? Math.max(1, Math.floor(num(cfg.flowTouchScoutMaxPerCycle, 4)))
+        : candidate.kind === "parent-safety-scout"
+          ? Math.max(1, Math.floor(num(cfg.parentSafetyScoutMaxPerCycle, 4)))
+        : candidate.kind === "confidence-cross-scout"
+          ? Math.max(1, Math.floor(num(cfg.confidenceCrossScoutMaxPerCycle, 2)))
       : Infinity;
-  const childCount = Math.min(remainingRows, styleCap, scoutCap, Math.max(1, Math.ceil(baseChildren * earlyBoost * catchUpBoost)));
+  const spreadMakerLevels = cfg.spreadMakerChildrenAcrossLevels !== false && candidate.style === "maker-ladder";
+  const childCount = spreadMakerLevels
+    ? 1
+    : Math.min(remainingRows, styleCap, scoutCap, Math.max(1, Math.ceil(baseChildren * earlyBoost * catchUpBoost)));
   return Array.from({ length: childCount }, (_, index) => ({
     ...candidate,
     childCount,
@@ -3848,11 +5842,22 @@ function generateCloneOrders(clone, nowSec) {
   const signalBps = signal.signalBps;
   let preferred = signal.preferred;
   const signalAbs = Math.abs(signalBps);
+  const legKey = clone.legKey || slugLegKey(market?.slug);
+  const leg = cryptoLegForKey(legKey);
+  const is15m = leg?.horizon === "15m" || slugWindowSeconds(market?.slug) > 300;
   const flow = bonereaperFlowSignal(clone, cfg);
   let qualityScoutActive = false;
   let qualityScoutReason = "";
   let liveLearningScoutActive = false;
   let liveLearningScoutReason = "";
+  let bilateralInventoryScoutActive = false;
+  let bilateralInventoryScoutReason = "";
+  let windowParticipationScoutActive = false;
+  let windowParticipationScoutReason = "";
+  let parentSafetyScoutActive = false;
+  let parentSafetyScoutReason = "";
+  let fifteenMinuteTouchScoutActive = false;
+  let fifteenMinuteTouchScoutReason = "";
   const learnedScoutOutcome = clone.learner?.preferredOutcome || cfg.observedPreferredOutcome || "";
   const learnedScoutRows = learnedScoutOutcome ? num(clone.learner?.byOutcome?.[learnedScoutOutcome]?.rows, num(clone.learner?.preferredRows)) : 0;
   const learnedScoutUsdc = learnedScoutOutcome ? num(clone.learner?.byOutcome?.[learnedScoutOutcome]?.usdc, num(clone.learner?.preferredUsdc)) : 0;
@@ -3860,6 +5865,11 @@ function generateCloneOrders(clone, nowSec) {
   const learnedScoutDominance = learnedScoutTotalUsdc > 0 ? learnedScoutUsdc / learnedScoutTotalUsdc : 0;
   const learnedScoutAge = num(clone.learner?.lastBuyAgeSec, 999);
   const learnedScoutRecentRows = num(clone.learner?.recentBuyRows30s, num(cfg.observedRecentBuyRows30s));
+  const learnedSecondaryOutcome = clone.learner?.secondaryOutcome || cfg.bilateralInventoryScoutOutcome || (learnedScoutOutcome === "Up" ? "Down" : learnedScoutOutcome === "Down" ? "Up" : "");
+  const learnedSecondaryRows = learnedSecondaryOutcome ? num(clone.learner?.byOutcome?.[learnedSecondaryOutcome]?.rows, num(clone.learner?.secondaryRows)) : 0;
+  const learnedSecondaryUsdc = learnedSecondaryOutcome ? num(clone.learner?.byOutcome?.[learnedSecondaryOutcome]?.usdc, num(clone.learner?.secondaryUsdc)) : 0;
+  const learnedHistoricalBothRate = num(clone.learner?.bilateralWindowRate);
+  const learnedMedianMinorShare = num(clone.learner?.medianMinorShare);
   const learnedScoutDir = learnedScoutOutcome === "Up" ? 1 : learnedScoutOutcome === "Down" ? -1 : 0;
   const learnedScoutLocalOppose = learnedScoutDir ? learnedScoutDir * signalBps < -num(cfg.liveLearningScoutMaxLocalOpposeBps, 4) : true;
   const learnedScoutParentPreferred = cfg.parentPreferredOutcome || clone.parentTrend?.preferred || "";
@@ -3882,11 +5892,109 @@ function generateCloneOrders(clone, nowSec) {
     )
     && !learnedScoutLocalOppose
     && !learnedScoutParentOppose;
+  const bilateralInventoryAllowed = Boolean(cfg.bilateralInventoryScoutEnabled)
+    && Boolean(learnedScoutOutcome)
+    && Boolean(learnedSecondaryOutcome)
+    && learnedScoutOutcome !== learnedSecondaryOutcome
+    && (
+      learnedSecondaryRows >= 1
+      || learnedSecondaryUsdc >= POLYMARKET_MIN_ORDER_USDC
+      || learnedHistoricalBothRate >= 0.55
+    )
+    && (
+      learnedScoutRows + learnedSecondaryRows >= num(cfg.bilateralInventoryMinRows, 4)
+      || learnedScoutTotalUsdc >= num(cfg.bilateralInventoryMinUsdc, POLYMARKET_MIN_ORDER_USDC)
+      || learnedHistoricalBothRate >= 0.62
+    )
+    && (
+      learnedScoutAge <= num(cfg.liveLearningScoutMaxAgeSec, 60)
+      || learnedScoutRecentRows > 0
+      || flow.active
+      || learnedHistoricalBothRate >= 0.7
+    )
+    && remaining > Math.max(18, num(cfg.exitBeforeEndSec, 38) * 0.5);
+  const existingBuyCost = cloneBuyCost(clone);
+  const existingEntryRowsForParticipation = cloneEffectiveEntryRows(clone);
+  const upAskForParticipation = finiteNum(clone.orderbook?.Up?.ask);
+  const downAskForParticipation = finiteNum(clone.orderbook?.Down?.ask);
+  const cheaperOutcome = Number.isFinite(upAskForParticipation) && Number.isFinite(downAskForParticipation)
+    ? (upAskForParticipation <= downAskForParticipation ? "Up" : "Down")
+    : "";
+  const signalOutcome = signalBps > 0 ? "Up" : signalBps < 0 ? "Down" : "";
+  let windowParticipationOutcome = flow.active
+    ? flow.preferred
+    : learnedScoutOutcome
+      || cfg.parentPreferredOutcome
+      || signalOutcome
+      || cheaperOutcome;
+  const windowParticipationMaxTradableAsk = Math.max(
+    num(cfg.windowParticipationMakerMaxAsk, 0.9),
+    num(cfg.windowParticipationCrossMaxAsk, 0.86),
+  );
+  if (
+    signalOutcome
+    && windowParticipationOutcome
+    && signalOutcome !== windowParticipationOutcome
+    && Math.abs(signalBps) >= num(cfg.windowParticipationMaxLocalOpposeBps, 10)
+    && Number.isFinite(finiteNum(clone.orderbook?.[signalOutcome]?.ask))
+    && finiteNum(clone.orderbook?.[signalOutcome]?.ask) <= windowParticipationMaxTradableAsk
+  ) {
+    windowParticipationOutcome = signalOutcome;
+  }
+  const selectedParticipationAsk = finiteNum(clone.orderbook?.[windowParticipationOutcome]?.ask);
+  const cheaperParticipationAsk = finiteNum(clone.orderbook?.[cheaperOutcome]?.ask);
+  if (!Number.isFinite(selectedParticipationAsk)) {
+    const tradableOutcomes = OUTCOMES
+      .map((outcome) => ({ outcome, ask: finiteNum(clone.orderbook?.[outcome]?.ask) }))
+      .filter((row) => Number.isFinite(row.ask) && row.ask > 0 && row.ask <= windowParticipationMaxTradableAsk)
+      .sort((a, b) => a.ask - b.ask);
+    if (tradableOutcomes.length) windowParticipationOutcome = tradableOutcomes[0].outcome;
+  }
+  if (
+    cheaperOutcome
+    && cheaperOutcome !== windowParticipationOutcome
+    && Number.isFinite(cheaperParticipationAsk)
+    && cheaperParticipationAsk <= windowParticipationMaxTradableAsk
+    && (!Number.isFinite(selectedParticipationAsk) || selectedParticipationAsk > windowParticipationMaxTradableAsk)
+  ) {
+    windowParticipationOutcome = cheaperOutcome;
+  }
+  const smallBankrollForParticipation = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
+  const existingFilledRowsForParticipation = (clone.orders || []).filter((order) => (
+    order.action === "BUY_LIMIT"
+    && (num(order.filledShares) > 0 || num(order.filledCost) > 0)
+  )).length;
+  const firstCrossRows = Math.max(0, Math.floor(num(cfg.windowParticipationFirstCrossRows, 0)));
+  const firstCrossEligible = Boolean(cfg.windowParticipationFirstCrossEnabled)
+    && firstCrossRows > 0
+    && existingFilledRowsForParticipation < firstCrossRows
+    && remaining > num(cfg.windowParticipationFirstCrossMinRemainingSec, 0);
+  const windowParticipationCanCross = elapsed >= num(cfg.windowParticipationCrossAfterSec, Infinity)
+    && (
+      firstCrossEligible
+      || (existingBuyCost <= 0 && (existingEntryRowsForParticipation > 0 || smallBankrollForParticipation))
+    );
+  const windowParticipationAllowed = Boolean(cfg.windowParticipationScoutEnabled)
+    && Boolean(windowParticipationOutcome)
+    && Number.isFinite(elapsed)
+    && remaining > num(cfg.windowParticipationMinRemainingSec, 25)
+    && (
+      existingEntryRowsForParticipation < num(cfg.windowParticipationTargetRows, cfg.targetOrderRows || 1)
+      || windowParticipationCanCross
+    );
   if (cfg.parentConfirmOnly) {
     const parentPreferred = cfg.parentPreferredOutcome || clone.parentTrend?.preferred || "";
     const parentStrong = Boolean(cfg.parentTrendStrong || clone.parentTrend?.strong);
     const parentConfirmed = Boolean(preferred && parentPreferred && preferred === parentPreferred && parentStrong);
     const flowConfirmed = Boolean(flow.active);
+    if (parentConfirmed && cfg.parentSafetyScoutEnabled) {
+      const parentQuote = clone.orderbook?.[parentPreferred];
+      const parentAsk = finiteNum(parentQuote?.ask);
+      if (Number.isFinite(parentAsk) && parentAsk <= num(cfg.parentSafetyScoutMaxAsk, 0.88)) {
+        parentSafetyScoutActive = true;
+        parentSafetyScoutReason = `parent confirmed safety scout ${parentPreferred}: parent strong, ask ${round(parentAsk, 3)}`;
+      }
+    }
     if (flowConfirmed && !parentConfirmed) preferred = flow.preferred;
     const scoutThreshold = num(cfg.qualityScoutMinSignalBps, Math.max(2.8, num(cfg.minSignalBps, 3.2) - 0.4));
     const scoutPreferred = preferred || (signalBps >= scoutThreshold ? "Up" : signalBps <= -scoutThreshold ? "Down" : "");
@@ -3918,6 +6026,38 @@ function generateCloneOrders(clone, nowSec) {
       liveLearningScoutReason = `live learning scout ${preferred}: Bonereaper dominance ${round(learnedScoutDominance * 100, 1)}% rows ${learnedScoutRows} usdc ${round(learnedScoutUsdc, 2)} age ${round(learnedScoutAge, 1)}s`;
     }
     if (!parentConfirmed && !flowConfirmed && !qualityScoutActive && !liveLearningScoutActive) {
+      const parentQuote = clone.orderbook?.[parentPreferred];
+      const parentAsk = finiteNum(parentQuote?.ask);
+      const parentDir = parentPreferred === "Up" ? 1 : parentPreferred === "Down" ? -1 : 0;
+      const parentSafetyAllowed = Boolean(cfg.parentSafetyScoutEnabled)
+        && Boolean(parentStrong)
+        && Boolean(parentPreferred)
+        && Number.isFinite(parentAsk)
+        && parentAsk <= num(cfg.parentSafetyScoutMaxAsk, 0.88)
+        && parentDeltaAbs >= num(cfg.parentSafetyScoutMinParentBps, 5)
+        && parentDir * signalBps >= -num(cfg.parentSafetyScoutMaxLocalOpposeBps, 8)
+        && remaining > Math.max(18, num(cfg.exitBeforeEndSec, 38) * 0.5);
+      if (parentSafetyAllowed) {
+        preferred = parentPreferred;
+        parentSafetyScoutActive = true;
+        parentSafetyScoutReason = `parent safety scout ${preferred}: parent ${round(parentDeltaAbs, 2)} bps strong, ask ${round(parentAsk, 3)}, ${flow.reason}`;
+      }
+    }
+    if (!parentConfirmed && !flowConfirmed && !qualityScoutActive && !liveLearningScoutActive && !parentSafetyScoutActive) {
+      if (bilateralInventoryAllowed) {
+        preferred = learnedScoutOutcome || parentPreferred || preferred;
+        bilateralInventoryScoutActive = true;
+        bilateralInventoryScoutReason = `bilateral inventory scout ${learnedScoutOutcome}/${learnedSecondaryOutcome}: historical both-side ${round(learnedHistoricalBothRate * 100, 1)}%, secondary rows ${learnedSecondaryRows}, usdc ${round(learnedSecondaryUsdc, 2)}`;
+      }
+    }
+    if (!parentConfirmed && !flowConfirmed && !qualityScoutActive && !liveLearningScoutActive && !parentSafetyScoutActive && !bilateralInventoryScoutActive) {
+      if (windowParticipationAllowed) {
+        preferred = windowParticipationOutcome;
+        windowParticipationScoutActive = true;
+        windowParticipationScoutReason = `every-window participation ${preferred}: rows ${existingEntryRowsForParticipation}, buy cost ${round(existingBuyCost, 2)}U, ${windowParticipationCanCross ? "late cross allowed" : "maker-first scout"}`;
+      }
+    }
+    if (!parentConfirmed && !flowConfirmed && !qualityScoutActive && !liveLearningScoutActive && !parentSafetyScoutActive && !bilateralInventoryScoutActive && !windowParticipationScoutActive) {
       clone.lastDecision = {
         ts: nowSec,
         isoTime: isoFromSec(nowSec),
@@ -3950,7 +6090,9 @@ function generateCloneOrders(clone, nowSec) {
     if (scoutAllowed) {
       preferred = scoutPreferred;
       qualityScoutActive = true;
+      fifteenMinuteTouchScoutActive = Boolean(is15m && cfg.fifteenMinuteTouchScoutEnabled);
       qualityScoutReason = `15m maker scout ${preferred}: signal ${round(signalBps, 2)} bps, flow rows ${flowRows}, recent ${recentRows}, usdc ${round(flowUsdc, 2)}`;
+      fifteenMinuteTouchScoutReason = `15m touch scout ${preferred}: signal ${round(signalBps, 2)} bps, flow rows ${flowRows}, recent ${recentRows}, usdc ${round(flowUsdc, 2)}`;
     }
   }
   if (!cfg.parentConfirmOnly && !qualityScoutActive && liveLearningScoutAllowed) {
@@ -3958,10 +6100,30 @@ function generateCloneOrders(clone, nowSec) {
     liveLearningScoutActive = true;
     liveLearningScoutReason = `live learning scout ${preferred}: Bonereaper dominance ${round(learnedScoutDominance * 100, 1)}% rows ${learnedScoutRows} usdc ${round(learnedScoutUsdc, 2)} age ${round(learnedScoutAge, 1)}s`;
   }
+  if (!bilateralInventoryScoutActive && bilateralInventoryAllowed) {
+    preferred = preferred || learnedScoutOutcome;
+    bilateralInventoryScoutActive = true;
+    bilateralInventoryScoutReason = `bilateral inventory scout ${learnedScoutOutcome}/${learnedSecondaryOutcome}: historical both-side ${round(learnedHistoricalBothRate * 100, 1)}%, median minor ${round(learnedMedianMinorShare * 100, 1)}%`;
+  }
+  if (!windowParticipationScoutActive && windowParticipationAllowed) {
+    preferred = preferred || windowParticipationOutcome;
+    windowParticipationScoutActive = true;
+    windowParticipationScoutReason = `every-window participation ${preferred}: rows ${existingEntryRowsForParticipation}, buy cost ${round(existingBuyCost, 2)}U, ${windowParticipationCanCross ? "late cross allowed" : "maker-first scout"}`;
+  }
+  if (
+    windowParticipationScoutActive
+    && windowParticipationOutcome
+    && preferred
+    && preferred !== windowParticipationOutcome
+    && Math.abs(signalBps) >= num(cfg.windowParticipationMaxLocalOpposeBps, 10)
+  ) {
+    preferred = windowParticipationOutcome;
+    windowParticipationScoutReason = `${windowParticipationScoutReason}; local real-time signal overrides stale flow to ${preferred}`;
+  }
   const probeAllowed = Boolean(cfg.probeEnabled)
     && signalAbs >= num(cfg.probeMinSignalBps, 0.1)
     && remaining > 25;
-  if (!preferred && !probeAllowed) {
+  if (!preferred && !probeAllowed && !windowParticipationScoutActive) {
     clone.lastDecision = {
       ts: nowSec,
       isoTime: isoFromSec(nowSec),
@@ -3986,6 +6148,34 @@ function generateCloneOrders(clone, nowSec) {
       && dir * signalBps >= -num(cfg.liveLearningScoutMaxLocalOpposeBps, 4)
       && scoutFairGap >= -0.018
       && dir * num(signal.velocityBps, 0) >= -num(cfg.liveLearningScoutMaxLocalOpposeBps, 4);
+    const bilateralInventoryDirectionOk = Boolean(bilateralInventoryScoutActive)
+      && Boolean(learnedScoutOutcome)
+      && dir * signalBps >= -Math.max(6, num(cfg.liveLearningScoutMaxLocalOpposeBps, 4))
+      && dir * num(signal.velocityBps, 0) >= -Math.max(6, num(cfg.liveLearningScoutMaxLocalOpposeBps, 4));
+    const windowParticipationAskForGate = finiteNum(clone.orderbook?.[preferred]?.ask);
+    const windowParticipationCheapCrossOk = Boolean(windowParticipationScoutActive && firstCrossEligible)
+      && Number.isFinite(windowParticipationAskForGate)
+      && windowParticipationAskForGate <= num(cfg.windowParticipationCheapCrossMaxAsk, 0.2);
+    const windowParticipationDirectionOk = Boolean(windowParticipationScoutActive)
+      && (
+        windowParticipationCheapCrossOk
+        || (
+          dir * signalBps >= -num(cfg.windowParticipationMaxLocalOpposeBps, 10)
+          && dir * num(signal.velocityBps, 0) >= -num(cfg.windowParticipationMaxLocalOpposeBps, 10)
+        )
+      );
+    const parentSafetyDirectionOk = Boolean(parentSafetyScoutActive)
+      && dir * signalBps >= -num(cfg.parentSafetyScoutMaxLocalOpposeBps, 8);
+    const smallBankrollSignalFallbackQuote = clone.orderbook?.[signalOutcome];
+    const smallBankrollSignalFallbackAsk = finiteNum(smallBankrollSignalFallbackQuote?.ask);
+    const smallBankrollSignalFallbackOk = Boolean(smallBankrollForParticipation && cfg.smallBankrollSignalFallbackEnabled)
+      && Boolean(signalOutcome)
+      && signalOutcome !== preferred
+      && signalAbs >= num(cfg.smallBankrollSignalFallbackMinBps, num(cfg.highConfidenceBps, 8))
+      && Number.isFinite(smallBankrollSignalFallbackAsk)
+      && smallBankrollSignalFallbackAsk <= num(cfg.smallBankrollSignalFallbackMaxAsk, 0.94)
+      && (signalOutcome === "Up" ? signalBps : -signalBps) > 0
+      && (signalOutcome === "Up" ? num(signal.velocityBps, 0) : -num(signal.velocityBps, 0)) >= -num(cfg.smallBankrollSignalFallbackMaxVelocityOpposeBps, 1.4);
     if (scoutDirectionOk) {
       directionGate.ok = true;
       directionGate.scoutRelaxed = true;
@@ -3994,9 +6184,54 @@ function generateCloneOrders(clone, nowSec) {
       directionGate.ok = true;
       directionGate.liveLearningRelaxed = true;
       directionGate.reason = `${directionGate.reason}; relaxed for live-learning 5U maker scout`;
+    } else if (bilateralInventoryDirectionOk) {
+      directionGate.ok = true;
+      directionGate.bilateralInventoryRelaxed = true;
+      directionGate.reason = `${directionGate.reason}; relaxed for bilateral inventory maker scout`;
+    } else if (windowParticipationDirectionOk) {
+      directionGate.ok = true;
+      directionGate.windowParticipationRelaxed = true;
+      directionGate.reason = `${directionGate.reason}; relaxed for every-window ${windowParticipationCheapCrossOk ? "cheap-tail first-cross" : "participation scout"}`;
+    } else if (parentSafetyDirectionOk) {
+      directionGate.ok = true;
+      directionGate.parentSafetyRelaxed = true;
+      directionGate.reason = `${directionGate.reason}; relaxed for parent-safety scout`;
+    } else if (smallBankrollSignalFallbackOk) {
+      preferred = signalOutcome;
+      directionGate.ok = true;
+      directionGate.smallBankrollSignalFallback = true;
+      directionGate.reason = `${directionGate.reason}; 50U switched to strong local ${preferred} signal ${round(signalBps, 2)} bps at ask ${round(smallBankrollSignalFallbackAsk, 3)}`;
     }
   }
-  if (preferred && !directionGate.ok) {
+  const tailRiskSignalOppositeOutcome = signalOutcome === "Up" ? "Down" : signalOutcome === "Down" ? "Up" : "";
+  const tailRiskSignalAnchorQuote = clone.orderbook?.[signalOutcome];
+  const tailRiskSignalOppositeQuote = clone.orderbook?.[tailRiskSignalOppositeOutcome];
+  const tailRiskSignalAnchorPrice = Number.isFinite(tailRiskSignalAnchorQuote?.ask)
+    ? tailRiskSignalAnchorQuote.ask
+    : finiteNum(tailRiskSignalAnchorQuote?.bid);
+  const tailRiskSignalAnchorUsable = Boolean(smallBankrollForParticipation && signalOutcome && tailRiskSignalOppositeOutcome)
+    && Number.isFinite(tailRiskSignalAnchorPrice)
+    && tailRiskSignalAnchorPrice >= num(cfg.tailRiskScoutFavoriteMinAsk, 0.94)
+    && Number.isFinite(tailRiskSignalOppositeQuote?.ask)
+    && tailRiskSignalOppositeQuote.ask <= num(cfg.tailRiskScoutMaxAsk, 0.06)
+    && signalAbs >= Math.max(num(cfg.minSignalBps, 3), num(cfg.tailRiskScoutMinSignalBps, 4));
+  const tailRiskPreGateAnchorOutcome = tailRiskSignalAnchorUsable ? signalOutcome : preferred;
+  const tailRiskPreGateOutcome = tailRiskPreGateAnchorOutcome === "Up" ? "Down" : tailRiskPreGateAnchorOutcome === "Down" ? "Up" : "";
+  const tailRiskPreGateAnchorQuote = clone.orderbook?.[tailRiskPreGateAnchorOutcome];
+  const tailRiskPreGateOppositeQuote = clone.orderbook?.[tailRiskPreGateOutcome];
+  const tailRiskPreGateAnchorPrice = Number.isFinite(tailRiskPreGateAnchorQuote?.ask)
+    ? tailRiskPreGateAnchorQuote.ask
+    : finiteNum(tailRiskPreGateAnchorQuote?.bid);
+  const tailRiskPreGateMinRemainingSec = num(cfg.tailRiskScoutMinRemainingSec, Math.max(12, num(cfg.exitBeforeEndSec, 38) * 0.45));
+  const tailRiskPreGateAllowed = Boolean(cfg.tailRiskScoutEnabled)
+    && Boolean(tailRiskPreGateOutcome)
+    && remaining > tailRiskPreGateMinRemainingSec
+    && Number.isFinite(tailRiskPreGateAnchorPrice)
+    && tailRiskPreGateAnchorPrice >= num(cfg.tailRiskScoutFavoriteMinAsk, 0.94)
+    && Number.isFinite(tailRiskPreGateOppositeQuote?.ask)
+    && tailRiskPreGateOppositeQuote.ask <= num(cfg.tailRiskScoutMaxAsk, 0.06)
+    && (flow.active || signalAbs >= Math.max(num(cfg.minSignalBps, 3), num(cfg.tailRiskScoutMinSignalBps, 4)));
+  if (preferred && !directionGate.ok && !tailRiskPreGateAllowed) {
     clone.lastDecision = {
       ts: nowSec,
       isoTime: isoFromSec(nowSec),
@@ -4010,6 +6245,9 @@ function generateCloneOrders(clone, nowSec) {
       reason: directionGate.reason,
     };
     return;
+  } else if (preferred && !directionGate.ok && tailRiskPreGateAllowed) {
+    directionGate.tailRiskAllowed = true;
+    directionGate.reason = `${directionGate.reason}; tail-risk scout still allowed`;
   }
   const maxOrdersPerWindow = num(cfg.maxOrdersPerWindow);
   const entryOrderCount = cloneEffectiveEntryRows(clone);
@@ -4059,11 +6297,14 @@ function generateCloneOrders(clone, nowSec) {
     if (cfg.parentConfirmOnly && !qualityScoutActive && !liveLearningScoutActive && outcome !== parentOrFlowOutcome) continue;
     if (cfg.parentConfirmOnly && qualityScoutActive && outcome !== preferred) continue;
     if (cfg.parentConfirmOnly && liveLearningScoutActive && outcome !== preferred) continue;
+    if (cfg.parentConfirmOnly && parentSafetyScoutActive && outcome !== preferred) continue;
     if (!qualityScoutActive && cfg.parentBlockedOutcome === outcome && signalAbs < num(cfg.whaleConfidenceBps) * 1.15) continue;
     const strongMomentum = Math.abs(signalBps) >= num(cfg.minSignalBps) * 2;
     const isPreferred = outcome === preferred;
     const qualityScout = qualityScoutActive && outcome === preferred;
     const liveLearningScout = liveLearningScoutActive && outcome === preferred;
+    const windowParticipationScout = windowParticipationScoutActive && outcome === preferred;
+    const parentSafetyScout = parentSafetyScoutActive && outcome === preferred;
     const isLearnedProbe = learnedActive && outcome === learnedPreferred && (!preferred || !strongMomentum);
     const isProbe = !preferred || isLearnedProbe || (Boolean(cfg.probeEnabled) && signalAbs < num(cfg.minSignalBps));
     if (!isPreferred && !cfg.hedgeEnabled && !isProbe && !isLearnedProbe) continue;
@@ -4088,6 +6329,96 @@ function generateCloneOrders(clone, nowSec) {
       && quote.ask <= 0.99
       && (num(flow.dominance) >= 0.85 || clone.parentTrend?.strong)
       && num(flow.preferredRows) >= Math.max(4, Math.ceil(num(cfg.flowConfirmMinRows, 12) * 0.65));
+    const flowTouchScoutAllowed = Boolean(cfg.flowTouchScoutEnabled)
+      && flowDriven
+      && flowLadderAllowed
+      && quote.ask <= Math.min(num(cfg.maxAsk, 0.97), 0.97);
+    const fifteenMinuteTouchScout = fifteenMinuteTouchScoutActive && outcome === preferred;
+    if (windowParticipationScout && quote.ask <= num(cfg.windowParticipationMakerMaxAsk, cfg.maxAsk)) {
+      const tick = orderbookTickSize(quote);
+      const decimals = tick <= 0.001 ? 3 : 2;
+      const levels = [];
+      if (windowParticipationCanCross && quote.ask <= num(cfg.windowParticipationCrossMaxAsk, cfg.maxAsk)) {
+        levels.push({ style: "cross", limitPrice: takerLimitPrice(quote.ask, cfg) });
+      }
+      for (const offset of [tick, tick * 2, tick * 3, tick * 4, tick * 5, 0.015, 0.02, 0.025, 0.035, 0.045, 0.06, 0.08, 0.11]) {
+        const limitPrice = round(clamp(quote.ask - offset, 0.01, num(cfg.windowParticipationMakerMaxAsk, cfg.maxAsk)), decimals);
+        if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= quote.ask) continue;
+        if (levels.some((row) => Math.abs(row.limitPrice - limitPrice) < 0.000001)) continue;
+        levels.push({ style: "maker-ladder", limitPrice });
+      }
+      for (const level of levels.slice(0, 14)) {
+        const feeRate = feeRateForOrder(clone, outcome, level.style);
+        const effectivePrice = effectiveBuyPrice(level.limitPrice, feeRate);
+        const levelEdge = round(fair[outcome] - effectivePrice, 6);
+        if (levelEdge < -Math.abs(num(cfg.windowParticipationMaxEdgeDebt, 0.15))) continue;
+        candidates.push({
+          outcome,
+          style: level.style,
+          limitPrice: level.limitPrice,
+          priority: (level.style === "cross" ? 3.25 : 2.05) + Math.max(0, -levelEdge) * -0.5,
+          edge: levelEdge,
+          feeRate,
+          effectivePrice,
+          signalBps,
+          confidence: signal.confidence,
+          kind: "window-participation-scout",
+          reason: `${windowParticipationScoutReason}; ${level.style === "cross" ? "late 5U cross" : "near-touch maker"} ${round(level.limitPrice, 3)} after ask ${round(quote.ask, 3)}`,
+        });
+      }
+    }
+    if (flowTouchScoutAllowed) {
+      const tick = orderbookTickSize(quote);
+      const decimals = tick <= 0.001 ? 3 : 2;
+      const offsets = [tick, tick * 2, tick * 3, 0.025, 0.04, 0.055];
+      for (const offset of offsets) {
+        const limitPrice = round(clamp(quote.ask - offset, 0.01, num(cfg.maxAsk, 0.97)), decimals);
+        if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= quote.ask) continue;
+        const feeRate = feeRateForOrder(clone, outcome, "maker-ladder");
+        const effectivePrice = effectiveBuyPrice(limitPrice, feeRate);
+        const levelEdge = round(fair[outcome] - effectivePrice, 6);
+        if (levelEdge < -Math.abs(num(cfg.flowTouchScoutMaxEdgeDebt, 0.16))) continue;
+        candidates.push({
+          outcome,
+          style: "maker-ladder",
+          limitPrice,
+          priority: 3.65 + Math.max(0, num(flow.dominance) - 0.78) * 3 - Math.max(0, -levelEdge),
+          edge: levelEdge,
+          feeRate,
+          effectivePrice,
+          signalBps,
+          confidence: signal.confidence,
+          kind: "flow-touch-scout",
+          reason: `${flow.reason}; near-touch maker scout ${round(limitPrice, 3)} after ${round(quote.ask, 3)} ask`,
+        });
+      }
+    }
+    if (fifteenMinuteTouchScout && quote.ask <= num(cfg.fifteenMinuteTouchScoutMaxAsk, cfg.maxAsk)) {
+      const tick = orderbookTickSize(quote);
+      const decimals = tick <= 0.001 ? 3 : 2;
+      const offsets = [tick, tick * 2, tick * 3, 0.015, 0.025];
+      for (const offset of offsets) {
+        const limitPrice = round(clamp(quote.ask - offset, 0.01, num(cfg.maxAsk, 0.97)), decimals);
+        if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= quote.ask) continue;
+        const feeRate = feeRateForOrder(clone, outcome, "maker-ladder");
+        const effectivePrice = effectiveBuyPrice(limitPrice, feeRate);
+        const levelEdge = round(fair[outcome] - effectivePrice, 6);
+        if (levelEdge < -Math.abs(num(cfg.fifteenMinuteTouchScoutMaxEdgeDebt, 0.08))) continue;
+        candidates.push({
+          outcome,
+          style: "maker-ladder",
+          limitPrice,
+          priority: 3.05 + Math.max(0, signalAbs - num(cfg.fifteenMinuteTouchScoutMinSignalBps, 3)) * 0.05 - Math.max(0, -levelEdge),
+          edge: levelEdge,
+          feeRate,
+          effectivePrice,
+          signalBps,
+          confidence: signal.confidence,
+          kind: "fifteen-minute-touch-scout",
+          reason: `${fifteenMinuteTouchScoutReason || qualityScoutReason}; near-touch 15m maker ${round(limitPrice, 3)} after ${round(quote.ask, 3)} ask`,
+        });
+      }
+    }
     const directionalAllowed = hasExpectedEdge
       || (isPreferred && highConfidence && makerEdgeAtBetterPrice >= num(cfg.minExpectedEdge))
       || (qualityScout && (
@@ -4095,9 +6426,31 @@ function generateCloneOrders(clone, nowSec) {
         || (highConfidence && levelEdgeSafe(fair[outcome], quote.ask, cfg))
       ))
       || (liveLearningScout && makerEdgeAtBetterPrice >= num(cfg.liveLearningScoutMinEdge, 0.002))
+      || (parentSafetyScout && makerEdgeAtBetterPrice >= -Math.abs(num(cfg.parentSafetyScoutMaxEdgeDebt, 0.08)))
       || smallBankrollMakerRetraceAllowed
       || (flowDriven && (crossEdge >= 0.006 || makerEdgeAtBetterPrice >= num(cfg.flowConfirmMinEdge, -0.006)))
       || flowLadderAllowed;
+    const confidenceCrossAllowed = Boolean(cfg.confidenceCrossScoutEnabled)
+      && isPreferred
+      && strongMomentum
+      && quote.ask <= num(cfg.confidenceCrossScoutMaxAsk, 0.92)
+      && signalAbs >= num(cfg.confidenceCrossScoutMinSignalBps, 10)
+      && crossEdge >= -Math.abs(num(cfg.confidenceCrossScoutMaxEdgeDebt, 0.05));
+    if (confidenceCrossAllowed) {
+      candidates.push({
+        outcome,
+        style: "cross",
+        limitPrice: takerLimitPrice(quote.ask, cfg),
+        priority: 3.9 + Math.max(0, signalAbs - num(cfg.confidenceCrossScoutMinSignalBps, 10)) * 0.03,
+        edge: crossEdge,
+        feeRate: crossFeeRate,
+        effectivePrice: crossEffectiveAsk,
+        signalBps,
+        confidence: signal.confidence,
+        kind: "confidence-cross-scout",
+        reason: `confidence cross scout ${outcome}: signal ${round(signalBps, 2)} bps, ask ${round(quote.ask, 3)}, fee-adjusted edge ${round(crossEdge, 4)}`,
+      });
+    }
     const probeAllowedForOutcome = (isProbe || isLearnedProbe || qualityScout || liveLearningScout) && quote.ask <= cfg.maxAsk;
     if ((quote.ask <= cfg.maxAsk || highConfidencePriceAllowed || smallBankrollMakerRetraceAllowed || flowLadderAllowed) && (directionalAllowed || cheapHedge || probeAllowedForOutcome)) {
       let levels = cloneCandidateLevels(quote, cfg, isPreferred, strongMomentum, cheapHedge)
@@ -4116,9 +6469,11 @@ function generateCloneOrders(clone, nowSec) {
       const allowMicroCross = observedPressure && quote.ask <= Math.min(num(cfg.maxAsk), 0.96) && (levelEdgeSafe(fair[outcome], quote.ask, cfg) || isLearnedProbe);
       const filteredLevels = isProbe && !learnedBurst && !allowMicroCross ? levels.filter((level) => level.style === "maker-ladder") : levels;
       const flowKind = flowDriven && flow.mode === "opening-carry" ? "flow-carry" : "flow-confirm";
-      const kind = liveLearningScout ? "live-learning-scout" : qualityScout ? "quality-scout" : cheapHedge && !isPreferred ? "hedge" : isLearnedProbe ? "learned-probe" : isProbe ? "probe" : "directional";
+      const kind = parentSafetyScout ? "parent-safety-scout" : liveLearningScout ? "live-learning-scout" : qualityScout ? "quality-scout" : cheapHedge && !isPreferred ? "hedge" : isLearnedProbe ? "learned-probe" : isProbe ? "probe" : "directional";
       const reason = cheapHedge
         ? `Bonereaper-style hedge ${outcome} ask ${quote.ask} combo ${comboAsk}`
+        : parentSafetyScout
+          ? `${parentSafetyScoutReason}; parent-first live-paper participation`
         : liveLearningScout
           ? `${liveLearningScoutReason}; maker-first live-paper participation`
         : qualityScout
@@ -4141,6 +6496,7 @@ function generateCloneOrders(clone, nowSec) {
           && !(kind === "learned-probe" && levelEdge >= num(cfg.probeMinExpectedEdge))
           && !(kind === "learned-probe" && num(clone.learner?.byOutcome?.[outcome]?.usdc) > 0 && levelEdge >= -0.015)
           && !(kind === "live-learning-scout" && level.style === "maker-ladder" && levelEdge >= num(cfg.liveLearningScoutMinEdge, 0.002))
+          && !(kind === "parent-safety-scout" && levelEdge >= -Math.abs(num(cfg.parentSafetyScoutMaxEdgeDebt, 0.08)))
           && !(kind === "quality-scout" && level.style === "maker-ladder" && levelEdge >= num(cfg.probeMinExpectedEdge, num(cfg.minExpectedEdge) * 0.75))
           && !(kind === "quality-scout" && highConfidence && levelEdge >= -0.01)
           && !(flowDriven && levelEdge >= num(cfg.flowConfirmMinEdge, -0.006))
@@ -4172,6 +6528,148 @@ function generateCloneOrders(clone, nowSec) {
           confidence: signal.confidence,
           kind: flowDriven && !liveLearningScout ? flowKind : kind,
           reason: flowDriven && !liveLearningScout ? flow.reason : reason,
+        });
+      }
+    }
+  }
+
+  if (windowParticipationScoutActive && !candidates.some((row) => row.kind === "window-participation-scout")) {
+    const outcome = windowParticipationOutcome || preferred;
+    const quote = clone.orderbook?.[outcome];
+    const ask = finiteNum(quote?.ask);
+    if (outcome && Number.isFinite(ask) && ask <= num(cfg.windowParticipationMakerMaxAsk, 0.97)) {
+      const tick = orderbookTickSize(quote);
+      const decimals = tick <= 0.001 ? 3 : 2;
+      const levels = [];
+      if (windowParticipationCanCross && ask <= num(cfg.windowParticipationCrossMaxAsk, 0.93)) {
+        levels.push({ style: "cross", limitPrice: takerLimitPrice(ask, cfg) });
+      }
+      for (const offset of [tick, tick * 2, tick * 3, tick * 4, 0.015, 0.02, 0.025, 0.035, 0.045, 0.06, 0.08, 0.11]) {
+        const limitPrice = round(clamp(ask - offset, 0.01, num(cfg.windowParticipationMakerMaxAsk, cfg.maxAsk)), decimals);
+        if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= ask) continue;
+        if (levels.some((row) => Math.abs(row.limitPrice - limitPrice) < 0.000001)) continue;
+        levels.push({ style: "maker-ladder", limitPrice });
+      }
+      for (const level of levels.slice(0, 12)) {
+        const feeRate = feeRateForOrder(clone, outcome, level.style);
+        const effectivePrice = effectiveBuyPrice(level.limitPrice, feeRate);
+        const edge = round(fair[outcome] - effectivePrice, 6);
+        if (edge < -Math.abs(num(cfg.windowParticipationMaxEdgeDebt, 0.3))) continue;
+        candidates.push({
+          outcome,
+          style: level.style,
+          limitPrice: level.limitPrice,
+          priority: level.style === "cross" ? 3.15 : 2.1,
+          edge,
+          feeRate,
+          effectivePrice,
+          signalBps,
+          confidence: signal.confidence,
+          kind: "window-participation-scout",
+          reason: `${windowParticipationScoutReason}; fallback ${level.style === "cross" ? "late 5U cross" : "maker scout"} ${round(level.limitPrice, 3)} after ask ${round(ask, 3)}`,
+        });
+      }
+    }
+  }
+
+  const tailRiskMinRemainingSec = num(cfg.tailRiskScoutMinRemainingSec, Math.max(12, num(cfg.exitBeforeEndSec, 38) * 0.45));
+  if (cfg.tailRiskScoutEnabled && remaining > tailRiskMinRemainingSec) {
+    const anchorOutcome = tailRiskSignalAnchorUsable ? signalOutcome : (preferred || (flow.active ? flow.preferred : "") || learnedPreferred);
+    const oppositeOutcome = anchorOutcome === "Up" ? "Down" : anchorOutcome === "Down" ? "Up" : "";
+    const anchorQuote = clone.orderbook?.[anchorOutcome];
+    const oppositeQuote = clone.orderbook?.[oppositeOutcome];
+    const anchorPrice = Number.isFinite(anchorQuote?.ask) ? anchorQuote.ask : finiteNum(anchorQuote?.bid);
+    const anchorExpensive = Number.isFinite(anchorPrice) && anchorPrice >= num(cfg.tailRiskScoutFavoriteMinAsk, 0.94);
+    const oppositeCheap = Number.isFinite(oppositeQuote?.ask) && oppositeQuote.ask <= num(cfg.tailRiskScoutMaxAsk, 0.06);
+    const flowOrSignalHot = flow.active || signalAbs >= Math.max(num(cfg.minSignalBps, 3), num(cfg.tailRiskScoutMinSignalBps, 4));
+    const alreadyOpposite = pendingByDirection(clone, oppositeOutcome) + num(clone.positions?.[oppositeOutcome]?.cost);
+    if (oppositeOutcome && anchorExpensive && oppositeCheap && flowOrSignalHot && alreadyOpposite < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.tailRiskScoutOrderUsdc, POLYMARKET_MIN_ORDER_USDC) * 2.2)) {
+      const crossAllowed = oppositeQuote.ask <= num(cfg.tailRiskScoutCrossMaxAsk, 0.03);
+      const tick = orderbookTickSize(oppositeQuote);
+      const decimals = tick <= 0.001 ? 3 : 2;
+      const rawLimit = crossAllowed
+        ? takerLimitPrice(oppositeQuote.ask, cfg)
+        : round(clamp(oppositeQuote.ask - tick, 0.01, num(cfg.maxAsk, 0.97)), decimals);
+      const style = crossAllowed ? "cross" : "maker-ladder";
+      const feeRate = feeRateForOrder(clone, oppositeOutcome, style);
+      const effectivePrice = effectiveBuyPrice(rawLimit, feeRate);
+      candidates.push({
+        outcome: oppositeOutcome,
+        style,
+        limitPrice: rawLimit,
+        priority: 2.95 + Math.max(0, signalAbs - num(cfg.minSignalBps, 3)) * 0.02,
+        edge: round(fair[oppositeOutcome] - effectivePrice, 6),
+        feeRate,
+        effectivePrice,
+        signalBps,
+        confidence: signal.confidence,
+        kind: "tail-risk-scout",
+        reason: `tail reversal scout ${oppositeOutcome}: ${anchorOutcome} touch ${round(anchorPrice, 3)}, ${oppositeOutcome} ask ${round(oppositeQuote.ask, 3)}, signal ${round(signalBps, 2)} bps`,
+      });
+    }
+  }
+
+  if (bilateralInventoryScoutActive && cfg.bilateralInventoryScoutEnabled) {
+    const anchorOutcome = cfg.bilateralInventoryAnchorOutcome || learnedScoutOutcome || preferred || (flow.active ? flow.preferred : "");
+    const outcome = cfg.bilateralInventoryScoutOutcome || (anchorOutcome === "Up" ? "Down" : anchorOutcome === "Down" ? "Up" : "");
+    const quote = clone.orderbook?.[outcome];
+    const anchorQuote = clone.orderbook?.[anchorOutcome];
+    const ask = finiteNum(quote?.ask);
+    const anchorAsk = finiteNum(anchorQuote?.ask);
+    const invNow = positionInventory(clone);
+    const ownCost = num(invNow?.[outcome]?.cost) + num(invNow?.[outcome]?.pending);
+    const anchorCost = num(invNow?.[anchorOutcome]?.cost) + num(invNow?.[anchorOutcome]?.pending);
+    const targetShare = clamp(num(cfg.bilateralInventoryTargetMinorShare, 0.16), 0.06, 0.38);
+    const observedSecondaryTarget = Math.max(0, learnedSecondaryUsdc * (is15m ? 0.06 : 0.045));
+    const targetMinorCost = round(Math.max(
+      POLYMARKET_MIN_ORDER_USDC,
+      observedSecondaryTarget,
+      (anchorCost + POLYMARKET_MIN_ORDER_USDC) * targetShare,
+    ), 2);
+    const remainingMinorBudget = Math.min(
+      Math.max(0, targetMinorCost - ownCost),
+      Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.budgetUsdc) * (is15m ? 0.32 : 0.26)),
+    );
+    if (
+      outcome
+      && anchorOutcome
+      && outcome !== anchorOutcome
+      && Number.isFinite(ask)
+      && ask <= num(cfg.bilateralInventoryMaxAsk, 0.86)
+      && remainingMinorBudget >= POLYMARKET_MIN_ORDER_USDC
+      && remaining > Math.max(18, num(cfg.exitBeforeEndSec, 38) * 0.5)
+    ) {
+      const tick = orderbookTickSize(quote);
+      const decimals = tick <= 0.001 ? 3 : 2;
+      const levels = [];
+      if (ask <= num(cfg.bilateralInventoryCrossMaxAsk, 0.055)) {
+        levels.push({ style: "cross", limitPrice: takerLimitPrice(ask, cfg) });
+      }
+      const offsets = [tick, tick * 2, tick * 3, 0.015, 0.025, 0.04, 0.06, 0.085];
+      for (const offset of offsets) {
+        const limitPrice = round(clamp(ask - offset, 0.01, num(cfg.bilateralInventoryMaxAsk, cfg.maxAsk)), decimals);
+        if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= ask) continue;
+        if (levels.some((row) => Math.abs(row.limitPrice - limitPrice) < 0.000001)) continue;
+        levels.push({ style: "maker-ladder", limitPrice });
+      }
+      for (const level of levels.slice(0, 10)) {
+        const feeRate = feeRateForOrder(clone, outcome, level.style);
+        const effectivePrice = effectiveBuyPrice(level.limitPrice, feeRate);
+        const edge = round(fair[outcome] - effectivePrice, 6);
+        if (edge < -Math.abs(num(cfg.bilateralInventoryMaxEdgeDebt, 0.12))) continue;
+        const anchorExpensiveBoost = Number.isFinite(anchorAsk) && anchorAsk >= 0.88 ? 0.25 : 0;
+        candidates.push({
+          outcome,
+          style: level.style,
+          limitPrice: level.limitPrice,
+          priority: 2.35 + anchorExpensiveBoost + Math.max(0, learnedHistoricalBothRate - 0.55) * 1.6 + Math.max(0, targetMinorCost - ownCost) / Math.max(10, num(cfg.budgetUsdc)),
+          edge,
+          feeRate,
+          effectivePrice,
+          signalBps,
+          confidence: signal.confidence,
+          kind: "bilateral-inventory-scout",
+          reason: `${bilateralInventoryScoutReason}; target minor ${round(targetMinorCost, 2)}U, own ${round(ownCost, 2)}U, ask ${round(ask, 3)}, anchor ${anchorOutcome}`,
         });
       }
     }
@@ -4240,6 +6738,20 @@ function generateCloneOrders(clone, nowSec) {
   const maxScoutPerCycle = Math.max(1, Math.floor(num(cfg.qualityScoutMaxPerCycle, 2)));
   const learningScoutCount = selected.filter((row) => row.kind === "live-learning-scout").length;
   const maxLearningScoutPerCycle = Math.max(1, Math.floor(num(cfg.liveLearningScoutMaxPerCycle, 2)));
+  const flowTouchScoutCount = selected.filter((row) => row.kind === "flow-touch-scout").length;
+  const maxFlowTouchScoutPerCycle = Math.max(1, Math.floor(num(cfg.flowTouchScoutMaxPerCycle, 4)));
+  const fifteenMinuteTouchScoutCount = selected.filter((row) => row.kind === "fifteen-minute-touch-scout").length;
+  const maxFifteenMinuteTouchScoutPerCycle = Math.max(1, Math.floor(num(cfg.fifteenMinuteTouchScoutMaxPerCycle, 2)));
+  const tailRiskScoutCount = selected.filter((row) => row.kind === "tail-risk-scout").length;
+  const maxTailRiskScoutPerCycle = Math.max(1, Math.floor(num(cfg.tailRiskScoutMaxPerCycle, 2)));
+  const bilateralInventoryScoutCount = selected.filter((row) => row.kind === "bilateral-inventory-scout").length;
+  const maxBilateralInventoryScoutPerCycle = Math.max(1, Math.floor(num(cfg.bilateralInventoryScoutMaxPerCycle, 2)));
+  const windowParticipationScoutCount = selected.filter((row) => row.kind === "window-participation-scout").length;
+  const maxWindowParticipationScoutPerCycle = Math.max(1, Math.floor(num(cfg.windowParticipationScoutMaxPerCycle, 1)));
+  const parentSafetyScoutCount = selected.filter((row) => row.kind === "parent-safety-scout").length;
+  const maxParentSafetyScoutPerCycle = Math.max(1, Math.floor(num(cfg.parentSafetyScoutMaxPerCycle, 4)));
+  const confidenceCrossScoutCount = selected.filter((row) => row.kind === "confidence-cross-scout").length;
+  const maxConfidenceCrossScoutPerCycle = Math.max(1, Math.floor(num(cfg.confidenceCrossScoutMaxPerCycle, 2)));
   let selectedCapped = probeCount > maxProbePerCycle
     ? selected.filter((row) => row.kind !== "probe" && row.kind !== "learned-probe").concat(selected.filter((row) => row.kind === "probe" || row.kind === "learned-probe").slice(0, maxProbePerCycle))
     : selected;
@@ -4253,6 +6765,48 @@ function generateCloneOrders(clone, nowSec) {
     selectedCapped = selectedCapped
       .filter((row) => row.kind !== "live-learning-scout")
       .concat(selectedCapped.filter((row) => row.kind === "live-learning-scout").slice(0, maxLearningScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (flowTouchScoutCount > maxFlowTouchScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "flow-touch-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "flow-touch-scout").slice(0, maxFlowTouchScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (fifteenMinuteTouchScoutCount > maxFifteenMinuteTouchScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "fifteen-minute-touch-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "fifteen-minute-touch-scout").slice(0, maxFifteenMinuteTouchScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (tailRiskScoutCount > maxTailRiskScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "tail-risk-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "tail-risk-scout").slice(0, maxTailRiskScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (bilateralInventoryScoutCount > maxBilateralInventoryScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "bilateral-inventory-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "bilateral-inventory-scout").slice(0, maxBilateralInventoryScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (windowParticipationScoutCount > maxWindowParticipationScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "window-participation-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "window-participation-scout").slice(0, maxWindowParticipationScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (parentSafetyScoutCount > maxParentSafetyScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "parent-safety-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "parent-safety-scout").slice(0, maxParentSafetyScoutPerCycle))
+      .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+  }
+  if (confidenceCrossScoutCount > maxConfidenceCrossScoutPerCycle) {
+    selectedCapped = selectedCapped
+      .filter((row) => row.kind !== "confidence-cross-scout")
+      .concat(selectedCapped.filter((row) => row.kind === "confidence-cross-scout").slice(0, maxConfidenceCrossScoutPerCycle))
       .sort((a, b) => b.priority - a.priority || b.edge - a.edge);
   }
   if (!selectedCapped.length) {
@@ -4283,14 +6837,12 @@ function generateCloneOrders(clone, nowSec) {
     const limitPrice = Number.isFinite(candidate.limitPrice) ? candidate.limitPrice : candidate.style === "cross"
       ? takerLimitPrice(quote.ask, cfg)
       : round(clamp(Math.min(quote.ask - 0.01, num(quote.bid, quote.ask - 0.02) + 0.01), 0.01, cfg.maxAsk), 2);
-    if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice > cfg.maxAsk) continue;
-    if (limitPrice < num(cfg.minFillPrice, 0.01)) continue;
+    const maxLimitPrice = candidate.kind === "window-participation-scout"
+      ? Math.max(num(cfg.maxAsk, 0.97), num(cfg.windowParticipationMakerMaxAsk, 0.97), num(cfg.windowParticipationCrossMaxAsk, 0.93))
+      : cfg.maxAsk;
+    if (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice > maxLimitPrice) continue;
+    if (limitPrice < num(cfg.minFillPrice, 0.01) && candidate.kind !== "tail-risk-scout") continue;
     if (hasRecentCloneOrder(clone, candidate.outcome, limitPrice, nowSec, cfg.cooldownSec)) continue;
-    const depthUsdc = visibleAskDepthUsdc(quote, limitPrice);
-    if (candidate.style === "cross" && depthUsdc < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC))) continue;
-    if (candidate.style === "cross" && num(candidate.edge) >= num(cfg.minExpectedEdge)) {
-      releaseMakerOrdersForCross(clone, candidate.outcome, nowSec, "released stale maker orders for marketable paper entry");
-    }
     const directionTotal = num(clone.positions?.[candidate.outcome]?.cost) + pendingByDirection(clone, candidate.outcome);
     if (directionTotal >= cfg.maxDirectionExposureUsdc) continue;
     if (losingDirectionCap(clone, candidate.outcome, directionTotal) && candidate.kind !== "inventory-balance") continue;
@@ -4307,7 +6859,19 @@ function generateCloneOrders(clone, nowSec) {
       cfg.maxDirectionExposureUsdc - directionTotal,
     );
     if (cappedNotional + 0.000001 < minNotional) continue;
-    placeCloneOrder(clone, {
+
+    let shadowOrder = null;
+    if (candidate.style === "cross") {
+      const preflight = shadowLivePreflight(clone, candidate, { quote, limitPrice, notional: cappedNotional });
+      shadowOrder = recordShadowLiveOrder(clone, { nowSec, candidate, quote, limitPrice, notional: cappedNotional, preflight });
+      if (!shadowOrder) continue;
+      if (preflight.status !== "WOULD_SUBMIT_FILL") continue;
+      if (num(candidate.edge) >= num(cfg.minExpectedEdge)) {
+        releaseMakerOrdersForCross(clone, candidate.outcome, nowSec, "released stale maker orders for marketable paper entry");
+      }
+    }
+
+    const placedOrder = placeCloneOrder(clone, {
       nowSec,
       outcome: candidate.outcome,
       style: candidate.style,
@@ -4315,12 +6879,28 @@ function generateCloneOrders(clone, nowSec) {
       quoteAsk: quote.ask,
       quoteBid: quote.bid,
       notional: cappedNotional,
+      kind: candidate.kind,
       fairPrice: fair[candidate.outcome],
       feeRate: candidate.feeRate,
       effectivePrice: candidate.effectivePrice,
       btcDeltaBps: clone.btc?.deltaBps,
+      fokLike: candidate.style === "cross",
+      shadowLiveOrderId: shadowOrder?.id || "",
       reason: candidate.reason,
     });
+    if (shadowOrder) {
+      shadowOrder.paperOrderId = placedOrder?.id || "";
+      clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+      const filled = placedOrder
+        ? tryFillCloneOrder(clone, placedOrder, nowSec, "shadow FAK/IOC immediate receipt", { immediateFakLikeFill: true })
+        : false;
+      if (!filled && placedOrder && ["OPEN", "PARTIAL"].includes(placedOrder.status)) {
+        placedOrder.status = num(placedOrder.filledShares) > 0 ? "EXPIRED_PARTIAL" : "EXPIRED";
+        placedOrder.updatedAt = isoFromSec(nowSec);
+        placedOrder.cancelReason = "shadow FAK/IOC immediate receipt could not be reproduced";
+        markShadowLivePaperOrder(clone, placedOrder, placedOrder.status, { updatedAt: placedOrder.updatedAt, reason: placedOrder.cancelReason });
+      }
+    }
     placed += 1;
   }
   clone.lastDecision = {
@@ -4365,7 +6945,14 @@ function releaseMakerOrdersForCross(clone, outcome, nowSec, reason) {
 function placeCloneOrder(clone, spec) {
   clone.nextOrderId = num(clone.nextOrderId, 0) + 1;
   const feeRate = Number.isFinite(spec.feeRate) ? num(spec.feeRate) : feeRateForOrder(clone, spec.outcome, spec.style);
-  const effectivePrice = Number.isFinite(spec.effectivePrice) ? num(spec.effectivePrice) : effectiveBuyPrice(spec.limitPrice, feeRate);
+  const marketableAsk = spec.style !== "maker-ladder"
+    && Number.isFinite(num(spec.quoteAsk, NaN))
+    && num(spec.quoteAsk) > 0
+    && num(spec.quoteAsk) <= num(spec.limitPrice, Infinity)
+    ? num(spec.quoteAsk)
+    : null;
+  const sharePriceBasis = marketableAsk || num(spec.limitPrice);
+  const effectivePrice = effectiveBuyPrice(sharePriceBasis, feeRate);
   const shares = round(spec.notional / Math.max(0.000001, effectivePrice), 6);
   const executionLatencyMs = Math.max(0, num(clone.config?.executionLatencyMs, 600));
   const snapshotMs = marketClockNowMs(clone);
@@ -4383,11 +6970,15 @@ function placeCloneOrder(clone, spec) {
     action: "BUY_LIMIT",
     direction: spec.outcome,
     style: spec.style,
+    kind: spec.kind || "",
     limitPrice: round(spec.limitPrice, 6),
     quoteAsk: round(spec.quoteAsk, 6),
     quoteBid: Number.isFinite(spec.quoteBid) ? round(spec.quoteBid, 6) : null,
     quoteSnapshotAt: clone.orderbook?.updatedAt || "",
     quoteSource: clone.orderbook?.source || "",
+    fokLike: Boolean(spec.fokLike),
+    shadowLiveOrderId: spec.shadowLiveOrderId || "",
+    shadowLiveReadOnly: Boolean(spec.shadowLiveOrderId),
     fairPrice: round(spec.fairPrice, 6),
     feeRate: round(feeRate, 6),
     effectivePrice: round(effectivePrice, 6),
@@ -4402,45 +6993,121 @@ function placeCloneOrder(clone, spec) {
     reason: spec.reason,
   };
   clone.orders.unshift(order);
-  if (order.style !== "maker-ladder" && Number.isFinite(spec.quoteAsk) && spec.quoteAsk <= order.limitPrice) {
-    tryFillCloneOrder(clone, order, spec.nowSec, "marketable limit at current ask");
-  }
+  return order;
 }
 
-function tryFillCloneOrder(clone, order, nowSec, reason) {
+function tryFillCloneOrder(clone, order, nowSec, reason, options = {}) {
   if (order.status === "FILLED") return false;
-  const plan = simulateCloneFill(clone, order, nowSec, reason);
+  const plan = simulateCloneFill(clone, order, nowSec, reason, options);
   if (!plan || plan.shares <= 0 || plan.cost <= 0) return false;
   recordCloneFill(clone, order, plan, nowSec, reason);
   return true;
 }
 
-function simulateCloneFill(clone, order, nowSec, reason) {
+function simulateCloneFill(clone, order, nowSec, reason, options = {}) {
   const quote = clone.orderbook?.[order.direction];
   const cfg = clone.config || {};
-  const nowMs = marketClockNowMs(clone);
-  if (Number.isFinite(num(order.eligibleFillMs, NaN)) && nowMs < num(order.eligibleFillMs)) return null;
-  const ageSec = nowSec - num(order.ts);
-  const makerLike = order.style === "maker-ladder" || !String(reason).includes("marketable");
+  const rawNowMs = marketClockNowMs(clone);
+  const nowMs = rawNowMs;
+  if (!options.immediateFakLikeFill && Number.isFinite(num(order.eligibleFillMs, NaN)) && nowMs < num(order.eligibleFillMs)) return null;
+  const snapshotMs = num(order.snapshotMs, NaN);
+  const ageMs = Number.isFinite(snapshotMs)
+    ? Math.max(0, nowMs - snapshotMs)
+    : Math.max(0, (nowSec - num(order.ts)) * 1000);
+  const ageSec = ageMs / 1000;
+  const makerLike = order.style === "maker-ladder";
+  const tailRiskFokLike = tailRiskFokLikeOrder(order, cfg);
+  const crossFakLike = crossFakLikeOrder(order, cfg);
+  if (crossFakLike && ageMs > crossFakMaxFillAgeMs(order, cfg)) return null;
+  const quoteUpdatedMs = Date.parse(clone.orderbook?.updatedAt || quote?.updatedAt || "");
+  const maxBookStaleMs = crossFakLike
+    ? Math.min(tailRiskFokBookStaleAfterMs(cfg), num(cfg.liveReadyMaxBookAgeMs, 1000))
+    : num(cfg.bookStaleAfterMs, 2500);
+  const bookAgeMs = quoteAgeMs(quote, clone.orderbook);
+  if (crossFakLike && !Number.isFinite(quoteUpdatedMs) && !Number.isFinite(bookAgeMs)) return null;
+  if (Number.isFinite(bookAgeMs) && bookAgeMs > maxBookStaleMs) return null;
+  if (!makerLike && cfg.requireWebSocketCrossFill !== false && !webSocketQuoteFresh(clone.orderbook, quote, cfg)) return null;
   const fillLimit = cloneFillLimitPrice(order, quote, cfg);
-  if (!quote || !Number.isFinite(quote.ask) || !Number.isFinite(fillLimit) || quote.ask > fillLimit) return null;
-  if (makerLike && ageSec < num(cfg.queueDelaySec)) return null;
   const remaining = remainingOrderShares(order);
   if (remaining <= 0) return null;
+  if (!Number.isFinite(fillLimit)) return null;
+  const snapshotAsk = finiteNum(order.quoteAsk);
+  const currentAsk = finiteNum(quote?.ask);
+  const snapshotTakerAllowed = Boolean(!makerLike
+    && !crossFakLike
+    && cfg.allowSnapshotTakerFill
+    && Number.isFinite(snapshotAsk)
+    && snapshotAsk > 0
+    && snapshotAsk <= fillLimit
+    && ageSec <= num(cfg.takerSnapshotFillGraceSec, 2));
+  let fillQuote = quote;
+  let snapshotTakerFill = false;
+  if (!Number.isFinite(currentAsk) || currentAsk > fillLimit) {
+    if (!snapshotTakerAllowed) return null;
+    snapshotTakerFill = true;
+    fillQuote = {
+      ...(quote || {}),
+      ask: snapshotAsk,
+      asks: [{ price: snapshotAsk, size: Math.max(remaining, POLYMARKET_MIN_ORDER_SHARES) }],
+    };
+  }
+  if (makerLike && ageSec < num(cfg.queueDelaySec)) return null;
+  const bookSource = String(fillQuote?.source || clone.orderbook?.source || "").toLowerCase();
+  if (bookSource.includes("fallback") && !cfg.allowSyntheticFallbackFill) return null;
   const baseParticipation = num(cfg.liquidityParticipation, 0.35);
-  const participation = makerLike ? Math.min(baseParticipation * 0.35, 0.18) : Math.min(baseParticipation, 0.65);
-  const minFillPrice = num(cfg.minFillPrice, 0.01);
-  const levels = visibleAskLevelsAtOrBelow(quote, fillLimit)
+  const smallBankroll = num(cfg.bankrollUsdc, 0) > 0 && num(cfg.bankrollUsdc, 0) <= 100;
+  let makerParticipation = smallBankroll
+    ? Math.min(Math.max(baseParticipation * 0.72, 0.14), 0.18)
+    : Math.min(Math.max(baseParticipation * 0.72, 0.18), 0.32);
+  const touchMakerKinds = new Set(["fifteen-minute-touch-scout", "flow-touch-scout", "parent-safety-scout", "quality-scout"]);
+  if (makerLike && touchMakerKinds.has(String(order.kind || ""))) {
+    makerParticipation = smallBankroll
+      ? Math.min(Math.max(makerParticipation, 0.22), 0.28)
+      : Math.min(Math.max(makerParticipation, 0.42), 0.55);
+  }
+  const participation = makerLike ? makerParticipation : 1;
+  const depthHaircut = makerLike ? num(cfg.makerDepthHaircut, 0.42) : num(cfg.takerDepthHaircut, 0.72);
+  const minFillPrice = order.kind === "tail-risk-scout" ? 0.01 : num(cfg.minFillPrice, 0.01);
+  let levels = visibleAskLevelsAtOrBelow(fillQuote, fillLimit)
     .filter((level) => num(level.price) >= minFillPrice);
-  const visibleDepth = round(levels.reduce((total, level) => total + level.price * level.size, 0), 6);
-  if (!levels.length || visibleDepth < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC))) return null;
+  let visibleDepth = round(levels.reduce((total, level) => total + level.price * level.size, 0), 6);
+  const minOrderUsdc = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minFillUsdc, POLYMARKET_MIN_ORDER_USDC));
+  const remainingTargetUsdc = Math.max(minOrderUsdc, num(order.notional, minOrderUsdc) - num(order.filledCost, 0));
+  const requiredDepth = crossFakLike
+    ? round(remainingTargetUsdc / Math.max(0.000001, depthHaircut), 6)
+    : (!makerLike || touchMakerKinds.has(String(order.kind || "")))
+    ? minOrderUsdc
+    : Math.max(minOrderUsdc, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC));
+  let fallbackSyntheticFill = false;
+  if (
+    cfg.allowSyntheticFallbackFill
+    && cfg.smallBankrollFallbackFillEnabled
+    && smallBankroll
+    && !makerLike
+    && !crossFakLike
+    && visibleDepth < requiredDepth
+    && smallBankrollFallbackCrossEligible(fillQuote, fillLimit, cfg)
+  ) {
+    const syntheticPrice = finiteNum(fillQuote?.ask);
+    const syntheticDepthUsdc = Math.max(minOrderUsdc, num(cfg.smallBankrollFallbackSyntheticDepthUsdc, POLYMARKET_MIN_ORDER_USDC));
+    const syntheticShares = Math.max(remaining, syntheticDepthUsdc / syntheticPrice, POLYMARKET_MIN_ORDER_SHARES);
+    levels = [{ price: syntheticPrice, size: round(syntheticShares, 6) }];
+    visibleDepth = round(syntheticPrice * syntheticShares, 6);
+    fallbackSyntheticFill = true;
+  }
+  if (!levels.length || visibleDepth < requiredDepth) return null;
+  const queueAheadPct = makerLike ? num(cfg.makerQueueAheadPct, 0.72) : 0;
+  const queueAgeBoost = makerLike
+    ? clamp(Math.max(0, ageSec - num(cfg.queueDelaySec, 1)) / Math.max(10, num(cfg.orderTtlSec, 75)), 0, 0.28)
+    : 0;
+  const queueFillFraction = makerLike ? clamp(1 - queueAheadPct + queueAgeBoost, 0.01, 1) : 1;
   let fillShares = 0;
   let tradeCost = 0;
   let fee = 0;
   const usedLevels = [];
   for (const level of levels) {
     if (fillShares >= remaining) break;
-    const available = Math.max(0, level.size * participation);
+    const available = Math.max(0, level.size * participation * depthHaircut * queueFillFraction);
     const shares = Math.min(remaining - fillShares, available);
     if (shares <= 0) continue;
     fillShares += shares;
@@ -4453,7 +7120,7 @@ function simulateCloneFill(clone, order, nowSec, reason) {
   fee = round(fee, 6);
   const cost = round(tradeCost + fee, 6);
   fillShares = round(fillShares, 6);
-  if (cost < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minFillUsdc, POLYMARKET_MIN_ORDER_USDC))) return null;
+  if (cost < minOrderUsdc) return null;
   return {
     shares: fillShares,
     cost,
@@ -4463,6 +7130,16 @@ function simulateCloneFill(clone, order, nowSec, reason) {
     effectivePrice: fillShares > 0 ? round(cost / fillShares, 6) : null,
     levels: usedLevels,
     fillRatio: round(fillShares / Math.max(remaining, 1e-9), 6),
+    snapshotTakerFill,
+    fallbackSyntheticFill,
+    fokLikeFill: crossFakLike,
+    visibleDepth,
+    requiredDepth,
+    depthHaircut: round(depthHaircut, 4),
+    queueFillFraction: round(queueFillFraction, 4),
+    bookAgeMs: Number.isFinite(bookAgeMs) ? Math.max(0, Math.round(bookAgeMs)) : null,
+    bookTransport: quoteTransport(fillQuote, clone.orderbook),
+    fillMs: Math.round(nowMs),
   };
 }
 
@@ -4477,7 +7154,7 @@ function recordCloneFill(clone, order, plan, nowSec, reason) {
   order.status = order.remainingShares <= 0.000001 ? "FILLED" : "PARTIAL";
   order.fillTs = nowSec;
   order.fillIsoTime = isoFromSec(nowSec);
-  order.fillMs = Math.round(marketClockNowMs(clone));
+  order.fillMs = Number.isFinite(num(plan.fillMs, NaN)) ? Math.round(num(plan.fillMs)) : Math.round(marketClockNowMs(clone));
   order.fillLatencyMs = Number.isFinite(num(order.snapshotMs, NaN)) ? Math.max(0, order.fillMs - num(order.snapshotMs)) : null;
   order.fillPrice = fillPrice;
   order.fillCost = order.filledCost;
@@ -4497,6 +7174,15 @@ function recordCloneFill(clone, order, plan, nowSec, reason) {
     shares,
     levels: plan.levels,
     fillRatio: plan.fillRatio,
+    snapshotTakerFill: Boolean(plan.snapshotTakerFill),
+    fallbackSyntheticFill: Boolean(plan.fallbackSyntheticFill),
+    fokLikeFill: Boolean(plan.fokLikeFill),
+    visibleDepth: round(plan.visibleDepth, 6),
+    requiredDepth: round(plan.requiredDepth, 6),
+    depthHaircut: round(plan.depthHaircut, 4),
+    queueFillFraction: round(plan.queueFillFraction, 4),
+    bookAgeMs: Number.isFinite(num(plan.bookAgeMs, NaN)) ? Math.round(num(plan.bookAgeMs)) : null,
+    bookTransport: plan.bookTransport || "",
     executionLatencyMs: order.executionLatencyMs,
     quoteSnapshotAt: order.quoteSnapshotAt,
   });
@@ -4526,11 +7212,26 @@ function recordCloneFill(clone, order, plan, nowSec, reason) {
     reason: order.reason,
     fillReason: reason,
     fillRatio: plan.fillRatio,
+    snapshotTakerFill: Boolean(plan.snapshotTakerFill),
+    fallbackSyntheticFill: Boolean(plan.fallbackSyntheticFill),
+    fokLikeFill: Boolean(plan.fokLikeFill),
+    visibleDepth: round(plan.visibleDepth, 6),
+    requiredDepth: round(plan.requiredDepth, 6),
+    depthHaircut: round(plan.depthHaircut, 4),
+    queueFillFraction: round(plan.queueFillFraction, 4),
+    bookAgeMs: Number.isFinite(num(plan.bookAgeMs, NaN)) ? Math.round(num(plan.bookAgeMs)) : null,
+    bookTransport: plan.bookTransport || "",
     levels: plan.levels,
     executionLatencyMs: order.executionLatencyMs,
     quoteSnapshotAt: order.quoteSnapshotAt,
     btcDeltaBps: order.btcDeltaBps,
     fairPrice: order.fairPrice,
+  });
+  markShadowLivePaperOrder(clone, order, order.status, {
+    updatedAt: order.fillIsoTime,
+    fillCost: cost,
+    fillShares: shares,
+    reason,
   });
 }
 
@@ -4661,13 +7362,19 @@ function simulateCloneSell(clone, outcome, shares, limitPrice) {
   const quote = clone.orderbook?.[outcome];
   if (!quote || !Number.isFinite(quote.bid) || quote.bid < limitPrice) return null;
   const cfg = clone.config || {};
-  const participation = num(cfg.liquidityParticipation);
+  const nowMs = marketClockNowMs(clone);
+  const quoteUpdatedMs = Date.parse(clone.orderbook?.updatedAt || quote?.updatedAt || "");
+  if (Number.isFinite(quoteUpdatedMs) && nowMs - quoteUpdatedMs > num(cfg.bookStaleAfterMs, 2500)) return null;
+  const bookSource = String(quote?.source || clone.orderbook?.source || "").toLowerCase();
+  if (bookSource.includes("fallback") && !cfg.allowSyntheticFallbackFill) return null;
+  const participation = num(cfg.liquidityParticipation) * num(cfg.takerDepthHaircut, 0.72);
   const levels = (Array.isArray(quote.bids) ? quote.bids : [])
     .map((level) => ({ price: num(level.price), size: num(level.size) }))
     .filter((level) => Number.isFinite(level.price) && Number.isFinite(level.size) && level.price > 0 && level.size > 0 && level.price >= limitPrice)
     .sort((a, b) => b.price - a.price);
   const visibleDepth = round(levels.reduce((total, level) => total + level.price * level.size, 0), 6);
-  if (!levels.length || visibleDepth < Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC))) return null;
+  const requiredDepth = Math.max(POLYMARKET_MIN_ORDER_USDC, num(cfg.minVisibleDepthUsdc, POLYMARKET_MIN_ORDER_USDC));
+  if (!levels.length || visibleDepth < requiredDepth) return null;
   let soldShares = 0;
   let grossProceeds = 0;
   let fee = 0;
@@ -4695,6 +7402,9 @@ function simulateCloneSell(clone, outcome, shares, limitPrice) {
     avgPrice: soldShares > 0 ? round(grossProceeds / soldShares, 6) : null,
     effectivePrice: soldShares > 0 ? round(proceeds / soldShares, 6) : null,
     levels: usedLevels,
+    visibleDepth,
+    requiredDepth,
+    depthHaircut: round(num(cfg.takerDepthHaircut, 0.72), 4),
     fillRatio: round(soldShares / Math.max(shares, 1e-9), 6),
   };
 }
@@ -4732,8 +7442,10 @@ function cloneWindowSnapshot(clone, reason = "archive") {
   const sellProceeds = cloneSellProceeds(clone);
   const fillCount = (clone.fills || []).length;
   const orderCount = (clone.orders || []).length;
+  const shadowOrders = clone.shadowLive?.orders || [];
+  const shadowOrderCount = shadowOrders.length;
   const observedBuyRows = num(clone.calibration?.observedBuyRows);
-  if (cost <= 0 && fillCount <= 0 && orderCount <= 0 && observedBuyRows <= 0) return null;
+  if (cost <= 0 && fillCount <= 0 && orderCount <= 0 && shadowOrderCount <= 0 && observedBuyRows <= 0) return null;
   const pnl = clone.pnl?.settled ? num(clone.pnl.realized) : num(clone.pnl?.unrealized);
   const lastDecision = clone.lastDecision ? {
     ts: clone.lastDecision.ts,
@@ -4775,6 +7487,12 @@ function cloneWindowSnapshot(clone, reason = "archive") {
     pnl: round(pnl, 6),
     fillCount,
     orderCount,
+    executionStats: executionStatsFromOrdersAndFills(clone.orders || [], clone.fills || [], num(clone.config?.liveReadyMaxBookAgeMs, 1000)),
+    shadowLive: clone.shadowLive ? {
+      ...clone.shadowLive,
+      orders: shadowOrders.slice(0, 120).map((row) => ({ ...row })),
+      stats: shadowLiveStats(shadowOrders),
+    } : null,
     fills: (clone.fills || []).slice(0, 120).map((fill) => ({ ...fill })),
     noTradeReason: cost <= 0 && fillCount <= 0 && orderCount <= 0 ? (lastDecision?.reason || "no paper order generated") : "",
     lastDecision,
@@ -4811,6 +7529,7 @@ function cloneWindowSnapshot(clone, reason = "archive") {
       dailyLoss: clone.risk.dailyLoss,
       consecutiveLosses: clone.risk.consecutiveLosses,
     } : null,
+    liveTradeReadiness: clone.config?.liveTradeReadiness || null,
     adverseSelection: clone.adverseSelection ? {
       checked: clone.adverseSelection.checked,
       adverse: clone.adverseSelection.adverse,
@@ -4833,7 +7552,7 @@ function archiveCloneWindow(state, clone, reason) {
   if (index >= 0) state.cloneHistory[index] = snapshot;
   else state.cloneHistory.unshift(snapshot);
   state.cloneHistory.sort((a, b) => num(b.windowStart) - num(a.windowStart));
-  state.cloneHistory = state.cloneHistory.slice(0, 1000);
+  state.cloneHistory = state.cloneHistory.slice(0, 2000);
   recomputeCloneCumulative(state);
   return true;
 }
@@ -5228,8 +7947,17 @@ function compactState(state, opts) {
   if (state.clone) {
     state.clone.orders = (state.clone.orders || []).slice(0, 500);
     state.clone.fills = (state.clone.fills || []).slice(0, 500);
+    if (state.clone.shadowLive) {
+      state.clone.shadowLive.orders = (state.clone.shadowLive.orders || []).slice(0, 500);
+      state.clone.shadowLive.stats = shadowLiveStats(state.clone.shadowLive.orders);
+    }
   }
-  state.cloneHistory = (state.cloneHistory || []).slice(0, 1000);
+  for (const clone of Object.values(state.clonePortfolio?.assets || {})) {
+    if (!clone?.shadowLive) continue;
+    clone.shadowLive.orders = (clone.shadowLive.orders || []).slice(0, 500);
+    clone.shadowLive.stats = shadowLiveStats(clone.shadowLive.orders);
+  }
+  state.cloneHistory = (state.cloneHistory || []).slice(0, 2000);
 }
 
 function trimCloneForDashboard(clone, opts) {
@@ -5238,12 +7966,26 @@ function trimCloneForDashboard(clone, opts) {
     ...clone,
     orders: (clone.orders || []).slice(0, opts.dashboardMaxOrders),
     fills: (clone.fills || []).slice(0, opts.dashboardMaxTrades),
+    shadowLive: clone.shadowLive ? {
+      ...clone.shadowLive,
+      orders: (clone.shadowLive.orders || []).slice(0, opts.dashboardMaxOrders),
+      stats: shadowLiveStats(clone.shadowLive.orders || []),
+    } : undefined,
   };
+}
+
+function cloneHistoryForDashboard(state, opts) {
+  const rows = state.cloneHistory || [];
+  const versionId = state.cloneVersion?.id || "";
+  if (versionId) return rows.filter((row) => row?.strategyVersionId === versionId);
+  return rows.slice(0, opts.dashboardMaxHistory);
 }
 
 function dashboardState(state, opts) {
   const assets = state.clonePortfolio?.assets || {};
   const trimmedAssets = Object.fromEntries(Object.entries(assets).map(([key, clone]) => [key, trimCloneForDashboard(clone, opts)]));
+  const dashboardHistory = cloneHistoryForDashboard(state, opts);
+  const versionId = state.cloneVersion?.id || "";
   return {
     wallet: state.wallet,
     startedAt: state.startedAt,
@@ -5272,11 +8014,13 @@ function dashboardState(state, opts) {
     hourlyPerformance: state.hourlyPerformance,
     winrateComparison: state.winrateComparison,
     trades: (state.trades || []).slice(0, opts.dashboardMaxTrades),
-    cloneHistory: (state.cloneHistory || []).slice(0, opts.dashboardMaxHistory),
+    cloneHistory: dashboardHistory,
     dashboard: {
       optimized: true,
       maxTrades: opts.dashboardMaxTrades,
       maxHistory: opts.dashboardMaxHistory,
+      historyMode: versionId ? "current-version-all" : "recent",
+      historyRows: dashboardHistory.length,
       maxOrders: opts.dashboardMaxOrders,
       fullStateBytes: 0,
       generatedAt: new Date().toISOString(),
@@ -5792,6 +8536,7 @@ function renderDashboardHtml() {
     <div class="card"><span>Bonereaper 胜率</span><b id="bonereaperWinRate">-</b></div>
     <div class="card"><span>我们方向命中率</span><b id="ourDirectionRate">-</b></div>
     <div class="card"><span>Bonereaper 方向命中率</span><b id="bonereaperDirectionRate">-</b></div>
+    <div class="card"><span>Shadow Live FAK/IOC</span><b id="shadowLive">-</b></div>
   </section>
   <div class="muted" id="decision">-</div>
   <section class="chartPanel">
@@ -5831,7 +8576,7 @@ function renderDashboardHtml() {
   <section class="chartPanel">
     <div class="chartHead">
       <div>
-        <h2>总收益曲线图</h2>
+        <h2>当前版本收益曲线图</h2>
         <div class="muted" id="totalPnlChartMeta">-</div>
       </div>
       <div class="legend">
@@ -5863,6 +8608,13 @@ function renderDashboardHtml() {
         </table>
       </div>
     </section>
+  </div>
+  <h2>Shadow Live FAK/IOC</h2>
+  <div class="wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Status</th><th>Leg</th><th>Dir</th><th>Kind</th><th class="num">Limit</th><th class="num">Ask</th><th class="num">Depth</th><th class="num">Need</th><th>Receipt</th></tr></thead>
+      <tbody id="shadowLiveRows"></tbody>
+    </table>
   </div>
   <h2>模拟累计历史</h2>
   <div class="wrap">
@@ -5898,6 +8650,8 @@ function renderDashboardHtml() {
       { key:'ETH5m', label:'ETH 5m', color:'#f2cc60' },
       { key:'ETH15m', label:'ETH 15m', color:'#56d4dd' },
     ];
+    const TOTAL_CURVE_HOURS = 24;
+    const TOTAL_CURVE_MS = TOTAL_CURVE_HOURS * 60 * 60 * 1000;
     const legKeyFromSlug = slug => {
       const match = String(slug || '').match(/^(btc|eth)-updown-(5m|15m)-/i);
       return match ? match[1].toUpperCase() + match[2].toLowerCase() : '';
@@ -6021,7 +8775,7 @@ function renderDashboardHtml() {
         marketSlug: clone.market?.slug,
         source: 'live'
       })));
-      const archivedCloneFills = (last.cloneHistory || []).flatMap(win => {
+      const archivedCloneFills = currentVersionHistoryRows().flatMap(win => {
         if (!win || !win.slug) return [];
         if (Array.isArray(win.fills) && win.fills.length) {
           return win.fills.map(row => ({
@@ -6072,6 +8826,28 @@ function renderDashboardHtml() {
         legKey: clone.legKey,
         marketSlug: clone.market?.slug,
       }))).sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+      const liveShadowOrders = portfolioClones.flatMap(clone => (clone.shadowLive?.orders || []).map(row => ({
+        ...row,
+        legKey: row.legKey || clone.legKey,
+        marketSlug: row.slug || clone.market?.slug,
+        source: 'live'
+      })));
+      const archivedShadowOrders = currentVersionHistoryRows().flatMap(win => (win.shadowLive?.orders || []).map(row => ({
+        ...row,
+        legKey: row.legKey || win.legKey,
+        marketSlug: row.slug || win.slug,
+        archivedAt: win.archivedAt,
+        source: 'archive'
+      })));
+      const shadowSeen = new Set();
+      const allShadowLiveOrders = liveShadowOrders.concat(archivedShadowOrders)
+        .filter(row => {
+          const key = row.id || [row.marketSlug, row.legKey, row.direction, row.ts, row.status, row.limitPrice].join('|');
+          if (shadowSeen.has(key)) return false;
+          shadowSeen.add(key);
+          return true;
+        })
+        .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
       const btc15Summary = legSummary('BTC15m');
       const eth5Summary = legSummary('ETH5m');
       const eth15Summary = legSummary('ETH15m');
@@ -6162,19 +8938,29 @@ function renderDashboardHtml() {
       els.riskGuard.textContent = risk.reason ? '仅提示' : '运行中';
       els.riskGuard.className = risk.reason ? 'warn' : 'ok';
       els.openSample.textContent = btc.openPrice == null ? '-' : fmt(btc.openPrice) + ' / ' + esc(btc.openPriceSource || '-');
-      const archivedFillCount = (last.cloneHistory || []).reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
-      const archivedTradeWindows = (last.cloneHistory || []).filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0).length;
-      const latestArchivedFill = (last.cloneHistory || []).find(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
+      const versionHistory = currentVersionHistoryRows();
+      const archivedFillCount = versionHistory.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
+      const archivedTradeWindows = versionHistory.filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0).length;
+      const latestArchivedFill = versionHistory.find(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
       els.cloneFills.textContent = '明细 ' + allCloneFills.length + ' / 归档笔数 ' + archivedFillCount + ' / 成交窗口 ' + archivedTradeWindows
         + (latestArchivedFill?.archivedAt ? ' / 最新 ' + new Date(latestArchivedFill.archivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '');
       els.calibration.textContent = cal.observedBuyRows ? (cal.matchedRows + '/' + cal.observedBuyRows) : '-';
       const ac = adaptive.effectiveConfig || c.config || {};
+      const liveGate = ac.liveTradeReadiness || {};
+      const liveExec = liveGate.execution || {};
+      const liveBook = liveGate.orderbook || {};
+      const liveGateLabel = liveGate.ready ? 'PASS' : 'BLOCK';
+      const liveFokRate = liveExec.fokLikeFillRate == null ? '-' : fmt(Number(liveExec.fokLikeFillRate) * 100, 1) + '%';
+      const shadowStats = liveGate.shadowLive || c.shadowLive?.stats || {};
+      const shadowRate = shadowStats.expectedFillRate == null ? '-' : fmt(Number(shadowStats.expectedFillRate) * 100, 1) + '%';
+      const liveWsFresh = (liveBook.websocketFreshOutcomes ?? 0) + '/2' + (liveBook.maxAgeMs == null ? '' : ' ' + esc(liveBook.maxAgeMs) + 'ms');
+      const liveBlockReason = Array.isArray(liveGate.reasons) && liveGate.reasons.length ? ' / ' + esc(liveGate.reasons.slice(0, 2).join('; ')) : '';
       els.learnerStatus.textContent = (learner.currentObservedBuys ?? 0) + '笔 / 偏向 ' + dirText(learner.preferredOutcome || '-') + ' / 近30秒 ' + (learner.recentBuyRows30s ?? 0);
       els.versionInfo.textContent = (version.startedAt ? new Date(version.startedAt).toLocaleTimeString() : '已归零') + ' 起';
       els.minTradeRule.textContent = '成交>= ' + esc(ac.minFillUsdc ?? 1) + 'U / 最低价>= ' + esc(ac.minFillPrice ?? 0.01) + ' / 深度>= ' + esc(ac.minVisibleDepthUsdc ?? 1) + 'U / maker击穿 ' + esc(ac.makerPenetrationTicks ?? 1) + ' tick';
-      els.executionLatency.textContent = esc(ac.executionLatencyMs ?? 600) + 'ms / 快照后才允许成交';
+      els.executionLatency.textContent = esc(ac.executionLatencyMs ?? 600) + 'ms / 快照后才允许成交 / WS ' + esc(liveWsFresh);
       const modeLabel = ac.smallBankrollMode ? '50U模式 ' + esc(ac.smallBankrollMode) + ' / ' : ac.liveReadyMode ? '实盘预备 ' + esc(ac.liveReadyMode) + ' / ' : '';
-      els.adaptiveParams.textContent = modeLabel + '预算 ' + esc(ac.budgetUsdc ?? '-') + ' / 目标笔数 ' + esc(ac.targetOrderRows ?? '-') + ' / 方向确认 ' + esc(ac.directionConfirmEnabled ? '开' : '关') + ' / 方向阈值 ' + esc(ac.directionMinDeltaBps ?? '-') + 'bps / 探针 ' + esc(ac.probeOrderUsdc ?? '-') + ' / 单笔 ' + esc(ac.orderUsdc ?? '-') + ' / 最大 ' + esc(ac.maxClipUsdc ?? '-') + ' / 吃单费 ' + esc(ac.takerFeeRate ?? '-') + ' / 参与深度 ' + esc(ac.liquidityParticipation ?? '-') + ' / 退出 ' + esc(ac.exitEnabled ? '开' : '关') + ' / 反向 ' + esc(ac.hedgeEnabled ? '开' : '关');
+      els.adaptiveParams.textContent = modeLabel + '预算 ' + esc(ac.budgetUsdc ?? '-') + ' / 目标笔数 ' + esc(ac.targetOrderRows ?? '-') + ' / 方向确认 ' + esc(ac.directionConfirmEnabled ? '开' : '关') + ' / 方向阈值 ' + esc(ac.directionMinDeltaBps ?? '-') + 'bps / 探针 ' + esc(ac.probeOrderUsdc ?? '-') + ' / 单笔 ' + esc(ac.orderUsdc ?? '-') + ' / 最大 ' + esc(ac.maxClipUsdc ?? '-') + ' / 吃单费 ' + esc(ac.takerFeeRate ?? '-') + ' / 参与深度 ' + esc(ac.liquidityParticipation ?? '-') + ' / 退出 ' + esc(ac.exitEnabled ? '开' : '关') + ' / 反向 ' + esc(ac.hedgeEnabled ? '开' : '关') + ' / LiveGate ' + esc(liveGateLabel) + ' / FOK ' + esc(liveFokRate) + liveBlockReason;
       els.cloneUnsettledWindows.textContent = cum.unsettledWindows ?? ((last.cloneHistory || []).filter(row => !row.settled).length);
       els.finalizedWindows.textContent = cum.finalizedWindows ?? 0;
       const wr = last.winrateComparison || {};
@@ -6189,6 +8975,10 @@ function renderDashboardHtml() {
       els.ourDirectionRate.className = Number(ourWr.directionHitRate) >= Number(boneWr.directionHitRate || 0) ? 'ok' : 'warn';
       els.bonereaperDirectionRate.textContent = pctText(boneWr.directionHitRate);
       els.bonereaperDirectionRate.className = Number(boneWr.directionHitRate) >= 50 ? 'ok' : 'warn';
+      if (els.shadowLive) {
+        els.shadowLive.textContent = esc(shadowStats.attempts ?? 0) + ' tries / fill ' + esc(shadowRate) + ' / submit ' + esc(shadowStats.wouldSubmit ?? 0);
+        els.shadowLive.className = Number(shadowStats.expectedFillRate) >= 0.35 ? 'ok' : Number(shadowStats.attempts) > 0 ? 'warn' : '';
+      }
       els.winrateMeta.textContent = wr.period ? ('区间 ' + new Date(wr.period.startIso).toLocaleString() + ' - ' + new Date(wr.period.endIso).toLocaleString() + ' | 缓存公开成交 ' + esc(wr.cacheRows ?? 0) + ' 行 | ' + esc(wr.source || '')) : '等待下一轮统计';
       els.winrateRows.innerHTML = CHART_LEGS.map(leg => {
         const ours = ourWr.byLeg?.[leg.key] || {};
@@ -6223,9 +9013,30 @@ function renderDashboardHtml() {
       }).join('');
       const fills = (allCloneFills.length ? allCloneFills : (c.fills || [])).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
       els.cloneFillRows.innerHTML = fills.map(row => '<tr><td>'+esc(row.isoTime)+'</td><td>'+esc(actionText(row.action))+'</td><td>'+esc(dirText(row.direction))+'</td><td>'+esc(styleText(row.style))+'</td><td class="num">'+fmt(row.price,4)+'</td><td class="num">'+fmt(row.amountUsdc)+'</td><td class="num">'+fmt(row.shares)+'</td><td>'+esc(reasonText(row.reason))+'<br><span class="muted">'+esc(row.legKey || '')+' '+esc(row.marketSlug || '')+'</span><br><span class="muted">'+esc(reasonText(row.fillReason || ''))+' '+esc(row.fillRatio == null ? '' : '成交比例 '+row.fillRatio)+'</span></td></tr>').join('');
+      if (!fills.length) {
+        const noFillHint = allShadowLiveOrders.length
+          ? '当前严格影子版本暂无可计成交；Shadow Live 已记录 ' + esc(allShadowLiveOrders.length) + ' 条 FAK/IOC 候选，wouldSubmit ' + esc(shadowStats.wouldSubmit ?? 0) + '，详情见下方 Shadow Live FAK/IOC。'
+          : '当前严格影子版本暂无可计成交；等待 cross 候选或新鲜 WebSocket orderbook。';
+        els.cloneFillRows.innerHTML = '<tr><td colspan="8" class="muted">'+noFillHint+'</td></tr>';
+      }
       const orders = (allCloneOrders.length ? allCloneOrders : (c.orders || [])).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
       els.cloneOrderRows.innerHTML = orders.map(row => '<tr><td>'+esc(row.isoTime)+'</td><td>'+esc(statusText(row.status))+'</td><td>'+esc(dirText(row.direction))+'</td><td>'+esc(styleText(row.style))+'</td><td class="num">'+fmt(row.limitPrice,4)+'</td><td class="num">'+fmt(row.remainingShares ?? row.shares)+'</td><td>'+esc(reasonText(row.reason))+'</td></tr>').join('');
-      const history = (last.cloneHistory || []).filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
+      if (!orders.length) {
+        els.cloneOrderRows.innerHTML = '<tr><td colspan="7" class="muted">当前无纸面订单；cross 候选被 Shadow Live 拦截时不会生成模拟订单。</td></tr>';
+      }
+      const shadowRows = allShadowLiveOrders.filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
+      if (els.shadowLiveRows) {
+        els.shadowLiveRows.innerHTML = shadowRows.map(row => {
+          const cls = String(row.status || '').includes('WOULD_SUBMIT_FILL') ? 'ok' : String(row.status || '').includes('NO_SUBMIT') ? 'warn' : 'bad';
+          const receipt = esc(row.expectedReceipt || row.status || '')
+            + '<br><span class="muted">' + esc(row.bookTransport || '-') + ' age ' + esc(row.bookAgeMs ?? '-') + 'ms / ws ' + esc(row.websocketFresh ? 'fresh' : 'stale') + (row.paperOrderId ? ' / paper ' + esc(row.paperOrderId) : '') + '</span>';
+          return '<tr><td>'+esc(row.isoTime)+'</td><td class="'+cls+'">'+esc(row.status || '-')+'</td><td>'+esc(row.legKey || '')+'</td><td>'+esc(dirText(row.direction))+'</td><td>'+esc(row.kind || '')+'</td><td class="num">'+fmt(row.limitPrice,4)+'</td><td class="num">'+fmt(row.quoteAsk,4)+'</td><td class="num">'+fmt(row.visibleDepth,2)+'</td><td class="num">'+fmt(row.requiredDepth,2)+'</td><td>'+receipt+'</td></tr>';
+        }).join('');
+      }
+      if (els.shadowLiveRows && !shadowRows.length) {
+        els.shadowLiveRows.innerHTML = '<tr><td colspan="10" class="muted">暂无 Shadow Live FAK/IOC 候选；等待策略产生 cross 候选。</td></tr>';
+      }
+      const history = currentVersionHistoryRows().filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
       els.cloneHistoryRows.innerHTML = history.map(row => {
         const matched = row.calibration ? row.calibration.matchedRows + '/' + row.calibration.observedBuyRows : '-';
         const pnlCls = Number(row.pnl) >= 0 ? 'ok' : 'bad';
@@ -6239,12 +9050,55 @@ function renderDashboardHtml() {
       if (!Number.isFinite(start)) return String(row.slug || '').replace(/^(btc|eth)-updown-(5m|15m)-/i, '');
       return new Date(start * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     }
-    function chartPoints(limit = 160) {
+    function pointTimeMs(row) {
+      const archived = Date.parse(row.archivedAt || '');
+      if (Number.isFinite(archived)) return archived;
+      const end = Number(row.windowEnd);
+      if (Number.isFinite(end) && end > 0) return end * 1000;
+      const start = Number(row.windowStart || String(row.slug || '').match(/(\\d+)$/)?.[1]);
+      if (Number.isFinite(start) && start > 0) return start * 1000;
+      return row.current ? Date.now() : NaN;
+    }
+    function timeTickLabel(ms, includeDate = false) {
+      const date = new Date(ms);
+      if (!Number.isFinite(date.getTime())) return '-';
+      const clock = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return includeDate ? date.toLocaleDateString([], { month: '2-digit', day: '2-digit' }) + ' ' + clock : clock;
+    }
+    function totalCurveVersionStartMs() {
+      const startSec = Number(last.cloneVersion?.startSec);
+      if (Number.isFinite(startSec) && startSec > 0) return startSec * 1000;
+      const startedAt = Date.parse(last.cloneVersion?.startedAt || '');
+      return Number.isFinite(startedAt) ? startedAt : NaN;
+    }
+    function currentVersionHistoryRows() {
       const versionId = last.cloneVersion?.id || '';
-      const history = [...(last.cloneHistory || [])]
+      return (last.cloneHistory || [])
         .filter(row => row && row.slug)
-        .filter(row => !versionId || row.strategyVersionId === versionId)
-        .reverse();
+        .filter(row => !versionId || row.strategyVersionId === versionId);
+    }
+    function totalCurvePeriodText(points) {
+      const versionId = last.cloneVersion?.id || '当前版本';
+      const startMs = points[0]?.rangeStartMs ?? totalCurveVersionStartMs() ?? points[0]?.timeMs;
+      const endMs = points[0]?.rangeEndMs ?? points[points.length - 1]?.timeMs ?? Date.parse(last.updatedAt || '');
+      if (!points.length) return versionId + ' 暂无归档窗口';
+      return versionId + ' | ' + timeTickLabel(startMs, true) + ' - ' + timeTickLabel(endMs, true);
+    }
+    function currentVersionLegTotalsText() {
+      const versionId = last.cloneVersion?.id || '';
+      const totals = {};
+      for (const row of currentVersionHistoryRows()) {
+        if (!row.settled) continue;
+        const key = row.legKey || legKeyFromSlug(row.slug);
+        totals[key] = (totals[key] || 0) + (Number(row.pnl) || 0);
+      }
+      return CHART_LEGS
+        .map(leg => leg.label + '全版本 ' + signedFmt(totals[leg.key] || 0))
+        .join(' | ');
+    }
+    function chartPoints(limit = 0) {
+      const versionId = last.cloneVersion?.id || '';
+      const history = currentVersionHistoryRows().reverse();
       const points = history.map(row => ({
         slug: row.slug,
         legKey: row.legKey || legKeyFromSlug(row.slug),
@@ -6326,7 +9180,7 @@ function renderDashboardHtml() {
       const groups = CHART_LEGS.map((leg, legIndex) => ({
         ...leg,
         top: pad.top + legIndex * (panelH + panelGap),
-        points: points.filter(point => (point.legKey || legKeyFromSlug(point.slug)) === leg.key).slice(-42)
+        points: points.filter(point => (point.legKey || legKeyFromSlug(point.slug)) === leg.key)
       }));
       groups.forEach(group => {
         const top = group.top;
@@ -6436,8 +9290,8 @@ function renderDashboardHtml() {
       const worst = points.reduce((min, row) => row.pnl < min.pnl ? row : min, points[0]);
       const rh = last.hourlyPerformance?.rollingHour?.paper || {};
       const r24 = last.hourlyPerformance?.rolling24h?.paper || {};
-      const legSummary = groups.map(group => group.label + ':' + signedFmt(group.points.reduce((total, row) => total + row.pnl, 0))).join(' | ');
-      els.pnlChartMeta.textContent = '四盘口分图 | 最新 ' + chartLegLabel(lastPoint.legKey) + ' ' + fmt(lastPoint.pnl) + ' USDC | 最好 ' + chartLegLabel(best.legKey) + ' ' + fmt(best.pnl) + ' | 最差 ' + chartLegLabel(worst.legKey) + ' ' + fmt(worst.pnl) + ' | ' + legSummary + ' | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U';
+      const legSummary = groups.map(group => group.label + '全版本' + group.points.length + '窗 ' + signedFmt(group.points.reduce((total, row) => total + row.pnl, 0))).join(' | ');
+      els.pnlChartMeta.textContent = '四盘口分图：显示当前版本全部窗口 | 最新 ' + chartLegLabel(lastPoint.legKey) + ' ' + fmt(lastPoint.pnl) + ' USDC | 最好 ' + chartLegLabel(best.legKey) + ' ' + fmt(best.pnl) + ' | 最差 ' + chartLegLabel(worst.legKey) + ' ' + fmt(worst.pnl) + ' | 当前版本窗口 ' + legSummary + ' | 当前版本累计 ' + currentVersionLegTotalsText() + ' | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U';
     }
     function bankrollFromState() {
       const assets = Object.values(last.clonePortfolio?.assets || {});
@@ -6447,9 +9301,14 @@ function renderDashboardHtml() {
       return values.length ? values[0] : 0;
     }
     function totalCurvePoints() {
-      const points = chartPoints(1000);
+      const allPoints = chartPoints(0)
+        .map(point => ({ ...point, timeMs: pointTimeMs(point) }))
+        .filter(point => Number.isFinite(point.timeMs))
+        .sort((a, b) => a.timeMs - b.timeMs);
       const bankroll = bankrollFromState();
-      if (!points.length && bankroll > 0) {
+      if (!allPoints.length && bankroll > 0) {
+        const endMs = Date.parse(last.updatedAt || '') || Date.now();
+        const startMs = Number.isFinite(totalCurveVersionStartMs()) ? totalCurveVersionStartMs() : endMs;
         return [{
           slug: '50u-start',
           legKey: 'BANKROLL',
@@ -6466,13 +9325,24 @@ function renderDashboardHtml() {
           startingBankroll: bankroll,
           totalCumulative: bankroll,
           totalPnl: 0,
-          totalIndex: 0
+          totalIndex: 0,
+          timeMs: endMs,
+          rangeStartMs: startMs,
+          rangeEndMs: endMs
         }];
       }
+      const stateMs = Date.parse(last.updatedAt || '');
+      const latestPointMs = allPoints.length ? allPoints[allPoints.length - 1].timeMs : Date.now();
+      const rangeEndMs = Number.isFinite(stateMs) ? Math.max(stateMs, latestPointMs) : latestPointMs;
+      const versionStartMs = totalCurveVersionStartMs();
+      const firstPointMs = allPoints.length ? allPoints[0].timeMs : rangeEndMs;
+      const rangeStartMs = Number.isFinite(versionStartMs) ? Math.min(versionStartMs, firstPointMs) : firstPointMs;
+      let points = allPoints.filter(point => point.timeMs >= rangeStartMs && point.timeMs <= rangeEndMs);
+      if (!points.length && allPoints.length) points = allPoints.slice(-1);
       let running = bankroll || 0;
       return points.map((point, idx) => {
         running += Number(point.pnl) || 0;
-        return { ...point, startingBankroll: bankroll, totalCumulative: running, totalPnl: running - bankroll, totalIndex: idx };
+        return { ...point, startingBankroll: bankroll, totalCumulative: running, totalPnl: running - bankroll, totalIndex: idx, rangeStartMs, rangeEndMs };
       });
     }
     function updateTotalTradeMeta() {
@@ -6486,19 +9356,15 @@ function renderDashboardHtml() {
       const tradePoints = points.filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
       const totalFillCount = tradePoints.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
       const latestTradePoint = [...tradePoints].reverse()[0];
-      const today2030 = new Date();
-      today2030.setHours(20, 30, 0, 0);
-      const since2030 = tradePoints.filter(row => Date.parse(row.archivedAt || '') >= today2030.getTime());
-      const since2030Cost = since2030.reduce((total, row) => total + (Number(row.cost) || 0), 0);
-      const since2030Pnl = since2030.reduce((total, row) => total + (Number(row.pnl) || 0), 0);
-      const since2030Fills = since2030.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
       const rh = last.hourlyPerformance?.rollingHour?.paper || {};
+      const r24 = last.hourlyPerformance?.rolling24h?.paper || {};
       const latestTradeText = latestTradePoint?.archivedAt
         ? '最新成交 ' + new Date(latestTradePoint.archivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         : '最新成交 -';
+      const periodText = totalCurvePeriodText(points);
       els.totalPnlChartMeta.textContent = bankroll > 0
-        ? '50U账户权益 | 窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText + ' | 20:30后 ' + since2030Fills + '笔 / 成本 ' + fmt(since2030Cost) + 'U / 盈亏 ' + signedFmt(since2030Pnl) + 'U | 最新权益 ' + fmt(lastPoint.totalCumulative) + 'U | 累计盈亏 ' + signedFmt(lastPoint.totalPnl) + 'U | 最高 ' + fmt(highPoint.totalCumulative) + 'U | 最低 ' + fmt(lowPoint.totalCumulative) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U'
-        : '总收益曲线 | 图内窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText;
+        ? '50U 当前版本收益曲线 | ' + periodText + ' | 窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText + ' | 最新权益 ' + fmt(lastPoint.totalCumulative) + 'U | 版本累计 ' + signedFmt(lastPoint.totalPnl) + 'U | 最高 ' + fmt(highPoint.totalCumulative) + 'U | 最低 ' + fmt(lowPoint.totalCumulative) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U'
+        : '当前版本收益曲线 | ' + periodText + ' | 新版窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText;
     }
     function drawTotalPnlChart() {
       const canvas = els.totalPnlChart;
@@ -6544,7 +9410,10 @@ function renderDashboardHtml() {
       const yMargin = Math.max(1, (yMax - yMin) * 0.08);
       yMin -= yMargin;
       yMax += yMargin;
-      const xAt = idx => pad.left + (points.length === 1 ? plotW / 2 : idx / (points.length - 1) * plotW);
+      const rangeStartMs = points[0].rangeStartMs ?? Math.min(...points.map(point => point.timeMs));
+      const rangeEndMs = points[0].rangeEndMs ?? Math.max(...points.map(point => point.timeMs));
+      const rangeMs = Math.max(1, rangeEndMs - rangeStartMs);
+      const xAt = point => pad.left + Math.min(1, Math.max(0, ((point.timeMs ?? rangeEndMs) - rangeStartMs) / rangeMs)) * plotW;
       const yAt = value => pad.top + (yMax - value) / (yMax - yMin) * plotH;
       const zeroY = yAt(baseline);
       ctx.strokeStyle = '#24313d';
@@ -6569,11 +9438,11 @@ function renderDashboardHtml() {
       gradient.addColorStop(0, 'rgba(121,192,255,0.22)');
       gradient.addColorStop(1, 'rgba(121,192,255,0.02)');
       ctx.beginPath();
-      ctx.moveTo(xAt(0), zeroY);
-      points.forEach((point, idx) => {
-        ctx.lineTo(xAt(idx), yAt(point.totalCumulative));
+      ctx.moveTo(xAt(points[0]), zeroY);
+      points.forEach(point => {
+        ctx.lineTo(xAt(point), yAt(point.totalCumulative));
       });
-      ctx.lineTo(xAt(points.length - 1), zeroY);
+      ctx.lineTo(xAt(points[points.length - 1]), zeroY);
       ctx.closePath();
       ctx.fillStyle = gradient;
       ctx.fill();
@@ -6581,7 +9450,7 @@ function renderDashboardHtml() {
       ctx.lineWidth = 2;
       ctx.beginPath();
       points.forEach((point, idx) => {
-        const x = xAt(idx);
+        const x = xAt(point);
         const y = yAt(point.totalCumulative);
         if (idx === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
@@ -6589,8 +9458,8 @@ function renderDashboardHtml() {
       ctx.stroke();
       ctx.lineWidth = 1;
       totalChartHitBoxes = [];
-      points.forEach((point, idx) => {
-        const x = xAt(idx);
+      points.forEach(point => {
+        const x = xAt(point);
         const y = yAt(point.totalCumulative);
         totalChartHitBoxes.push({ x0: x - 10, x1: x + 10, y0: y - 10, y1: y + 10, x, y, point });
         ctx.fillStyle = point.pnl >= 0 ? '#3fb950' : '#f85149';
@@ -6604,13 +9473,14 @@ function renderDashboardHtml() {
           ctx.stroke();
         }
       });
-      const labelEvery = Math.max(1, Math.ceil(points.length / 8));
       ctx.fillStyle = '#8b949e';
       ctx.textAlign = 'center';
-      points.forEach((point, idx) => {
-        if (idx % labelEvery !== 0 && idx !== points.length - 1) return;
-        ctx.fillText(windowLabel(point), xAt(idx), height - 16);
-      });
+      const tickCount = width < 720 ? 4 : 6;
+      for (let i = 0; i <= tickCount; i += 1) {
+        const tickMs = rangeStartMs + rangeMs * (i / tickCount);
+        const x = pad.left + plotW * (i / tickCount);
+        ctx.fillText(timeTickLabel(tickMs, i === 0 || i === tickCount), x, height - 16);
+      }
       ctx.textAlign = 'left';
       const lastPoint = points[points.length - 1];
       const highPoint = points.reduce((max, row) => row.totalCumulative > max.totalCumulative ? row : max, points[0]);
@@ -6621,20 +9491,14 @@ function renderDashboardHtml() {
       const tradePoints = points.filter(row => Number(row.cost) > 0 || Number(row.fillCount) > 0);
       const totalFillCount = tradePoints.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
       const latestTradePoint = [...tradePoints].reverse()[0];
-      const today2030 = new Date();
-      today2030.setHours(20, 30, 0, 0);
-      const since2030 = tradePoints.filter(row => Date.parse(row.archivedAt || '') >= today2030.getTime());
-      const since2030Cost = since2030.reduce((total, row) => total + (Number(row.cost) || 0), 0);
-      const since2030Pnl = since2030.reduce((total, row) => total + (Number(row.pnl) || 0), 0);
-      const since2030Fills = since2030.reduce((total, row) => total + (Number(row.fillCount) || 0), 0);
       const latestTradeText = latestTradePoint?.archivedAt
         ? '最新成交 ' + new Date(latestTradePoint.archivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         : '最新成交 -';
-      const since2030Text = '20:30后 ' + since2030Fills + '笔 / 成本 ' + fmt(since2030Cost) + 'U / 盈亏 ' + signedFmt(since2030Pnl) + 'U';
+      const periodText = totalCurvePeriodText(points);
       if (els.totalPnlChartMeta) {
         els.totalPnlChartMeta.textContent = bankroll > 0
-          ? '50U账户权益 | 窗口 ' + points.length + ' 个 | 最新权益 ' + fmt(lastPoint.totalCumulative) + 'U | 累计盈亏 ' + signedFmt(lastPoint.totalPnl) + 'U | 最高 ' + fmt(highPoint.totalCumulative) + 'U | 最低 ' + fmt(lowPoint.totalCumulative) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U'
-          : '总收益曲线 | 图内窗口 ' + points.length + ' 个 | 最新累计 ' + signedFmt(lastPoint.totalCumulative) + ' USDC | 总账累计 ' + signedFmt(totalBook) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U';
+          ? '50U 当前版本收益曲线 | ' + periodText + ' | 窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText + ' | 最新权益 ' + fmt(lastPoint.totalCumulative) + 'U | 版本累计 ' + signedFmt(lastPoint.totalPnl) + 'U | 最高 ' + fmt(highPoint.totalCumulative) + 'U | 最低 ' + fmt(lowPoint.totalCumulative) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U'
+          : '当前版本收益曲线 | ' + periodText + ' | 新版窗口 ' + points.length + ' 个 / 成交窗口 ' + tradePoints.length + ' 个 / 成交 ' + totalFillCount + '笔 | ' + latestTradeText + ' | 新版累计 ' + signedFmt(lastPoint.totalCumulative) + ' USDC | 总账累计 ' + signedFmt(totalBook) + 'U | 滚动1小时 ' + fmt(rh.pnl) + 'U / 滚动24小时 ' + fmt(r24.pnl) + 'U';
       }
     }
     function hidePnlTooltip() {
@@ -6769,6 +9633,7 @@ async function flush(state, opts, options = {}) {
     await writeJsonAtomic(join(opts.out, "clone.json"), state.clone);
     await writeJsonAtomic(join(opts.out, "clone-orders.json"), state.clone.orders || []);
     await writeJsonAtomic(join(opts.out, "clone-fills.json"), state.clone.fills || []);
+    await writeJsonAtomic(join(opts.out, "shadow-live.json"), state.clone.shadowLive || {});
     await writeJsonAtomic(join(opts.out, "clone-risk.json"), state.clone.risk || {});
     await writeJsonAtomic(join(opts.out, "clone-adaptive.json"), state.clone.adaptive || {});
   }
@@ -6887,6 +9752,7 @@ async function sleep(ms) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (await restartWithNodeProxyIfNeeded(opts)) return;
   await ensureDir(opts.out);
   await writeTextAtomic(join(opts.out, "index.html"), renderDashboardHtml());
   const stateFile = join(opts.out, "state.json");
@@ -6898,26 +9764,42 @@ async function main() {
   state.eventUrl = opts.eventUrl || (opts.slug ? eventUrlForSlug(opts.slug) : null);
   state.autoBtc5m = opts.autoBtc5m;
   state.pollMs = opts.pollMs;
-  state.paperOnly = true;
+  state.liveOrderSwitch = buildRealOrderSwitchFromConfig(cloneConfig(opts));
+  state.paperOnly = !state.liveOrderSwitch.realOrderSubmitAllowed;
   opts.marketClockOffsetSec = num(state.marketClockOffsetSec, 0);
   ensureCloneState(state, opts);
   let first = true;
   let lastFlushMs = 0;
   let lastFullFlushMs = 0;
+  let lastActivityPollMs = 0;
 
   console.log(`Bonereaper live paper started: ${opts.out}`);
-  console.log("Paper-only: no real orders will be submitted.");
+  console.log(`Real-order switch: ${state.liveOrderSwitch.mode}; submitAllowed=${state.liveOrderSwitch.realOrderSubmitAllowed ? "yes" : "no"}.`);
+  if (state.liveOrderSwitch.blockers?.length) {
+    console.log(`Real-order blockers: ${state.liveOrderSwitch.blockers.join("; ")}`);
+  }
 
   while (true) {
     const startedAt = Date.now();
     try {
       maybeRollAutoBtc5m(state, opts);
-      const startSec = first && opts.backfillMinutes > 0 ? Math.floor(Date.now() / 1000) - opts.backfillMinutes * 60 : null;
-      if (first) console.log("[live] first loop: activity poll start");
-      await pollOnce(state, opts, startSec);
-      if (first) console.log("[live] first loop: activity poll done; clone refresh start");
+      if (first) console.log("[live] first loop: clone refresh start");
       await refreshCloneEngine(state, opts);
       if (first) console.log("[live] first loop: clone refresh done; flush start");
+      const activityPollIntervalMs = Math.max(3000, opts.pollMs * 6);
+      const shouldPollActivity = first || Date.now() - lastActivityPollMs >= activityPollIntervalMs;
+      if (shouldPollActivity) {
+        const beforeActivitySlug = opts.slug;
+        const startSec = first && opts.backfillMinutes > 0 ? Math.floor(Date.now() / 1000) - opts.backfillMinutes * 60 : null;
+        if (first) console.log("[live] first loop: activity poll start");
+        await pollOnce(state, opts, startSec);
+        lastActivityPollMs = Date.now();
+        maybeRollAutoBtc5m(state, opts);
+        if (opts.slug !== beforeActivitySlug) {
+          await refreshCloneEngine(state, opts);
+        }
+        if (first) console.log("[live] first loop: activity poll done");
+      }
       state.status = "ok";
       state.lastError = "";
       first = false;
